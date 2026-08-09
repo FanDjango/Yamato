@@ -171,10 +171,19 @@ pub fn parse_tpfancontrol_ini(text: &str) -> Result<Vec<Imported>, ImportError> 
 fn translate_level(level: i32) -> (u8, bool) {
     match level {
         n if n == INI_BIOS as i32 => (FAN_BIOS, false),
-        // 0x40 runs the blower with no governor. Level 7 is the fastest this
-        // program will ask for, and it is what somebody reaching for the
-        // disengaged byte was after.
-        n if n == FAN_DISENGAGED as i32 => (FAN_LEVEL_MAX, true),
+        // 0x40 runs the blower with no governor, past the speed the firmware
+        // holds it to. This program will not ask for that, and the honest
+        // substitute is the firmware step rather than level 7.
+        //
+        // Level 7 looks closer on paper, being the fastest ordinary speed. It
+        // is the worse answer. A manual level switches the firmware's own
+        // thermal management off, so substituting one would leave the machine
+        // pinned at a fixed speed with nothing else watching, at exactly the
+        // temperature the curve's author thought needed everything available.
+        // The firmware step keeps that management on and reacts faster than
+        // any polling loop, which is why it is already the top of every curve
+        // that ships.
+        n if n == FAN_DISENGAGED as i32 => (FAN_BIOS, true),
         n if (0..=FAN_LEVEL_MAX as i32).contains(&n) => (n as u8, false),
         // Anything else is not a level. The firmware step is the safe reading
         // of a number nobody can explain.
@@ -256,9 +265,14 @@ Level=90 128 0 7
     fn the_disengaged_byte_is_substituted_and_said_out_loud() {
         // 0x40 is refused everywhere else in this program, and importing one
         // is not a way around that.
+        //
+        // It becomes the firmware step, not level 7. Level 7 would be a manual
+        // level, and a manual level switches the firmware's own management
+        // off, which is not a trade worth making at the top of somebody else's
+        // curve.
         let found = parse_tpfancontrol_ini("Level=50 1 0 4\nLevel=88 64 0 5\n").unwrap();
 
-        assert_eq!(found[0].curve.points()[1].level, FAN_LEVEL_MAX);
+        assert_eq!(found[0].curve.points()[1].level, FAN_BIOS);
         assert_eq!(found[0].disengaged_at, vec![88]);
 
         for point in found[0].curve.points() {

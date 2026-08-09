@@ -14,14 +14,17 @@
 
 //! Embedded controller access for ThinkPads.
 //!
-//! The path is PawnIO over `DeviceIoControl`, using the stock `LpcACPIEC`
-//! module to reach the two ACPI EC ports.
+//! The path is PawnIO over `DeviceIoControl`. Which module rides on it
+//! depends on where this machine keeps its EC: the stock `LpcACPIEC` for the
+//! ACPI-specified ports, or `LpcIO` for the P53-class machines that put the
+//! controller at 0x1600/0x1604 instead. `Ec::open` probes both layouts and
+//! chooses on the evidence; nothing upstream needs to know which won.
 
 mod ec;
 mod lock;
 mod pawnio;
 
 pub use ec::{
-    Ec, EcState, FAN_BIOS, FAN_BITS, FAN_DISENGAGED, FAN_LEVEL_MAX, SENSOR_COUNT,
+    Ec, EcState, Probe, FAN_BIOS, FAN_BITS, FAN_DISENGAGED, FAN_LEVEL_MAX, SENSOR_COUNT,
 };
-pub use pawnio::{Error, PawnIo, MODULE_FILE};
+pub use pawnio::{Error, Layout, PawnIo, MODULE_FILES};

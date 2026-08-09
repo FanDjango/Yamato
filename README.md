@@ -311,8 +311,8 @@ build.
 
 MIT. See [LICENSE](LICENSE).
 
-`LpcACPIEC.bin` is a PawnIO module by namazso, LGPL-2.1-or-later, shipped
-unmodified. See [NOTICE.md](NOTICE.md).
+`LpcACPIEC.bin` and `LpcIO.bin` are PawnIO modules by namazso,
+LGPL-2.1-or-later, shipped unmodified. See [NOTICE.md](NOTICE.md).
 
 [tpfc]: https://github.com/ThinkPad-Forum/TPFanControl
 [tpfc2]: https://github.com/Shuzhengz/TPFanCtrl2

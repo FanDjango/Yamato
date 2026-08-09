@@ -313,6 +313,12 @@ pub struct Host {
     /// nothing shared with another thread, so writing a line cannot be waiting
     /// on anything while the controller is in the middle of a transaction.
     logger: crate::log::Logger,
+    /// Which EC port layout the probe chose at open and what both layouts
+    /// answered, one line. Never a setting, only a record: exposing the
+    /// choice as configuration would let it be wrong, and the machines that
+    /// need the alternate path are the ones nobody debugging a config file
+    /// can test.
+    ec_report: String,
     /// The flag the caller's loop watches, shared rather than copied.
     ///
     /// A tick that is already under way needs to know a stop is coming, so it
@@ -390,6 +396,11 @@ impl Host {
         let channel = Channel::create().ok_or("could not publish the shared state")?;
 
         let ec = Ec::open().map_err(|e| e.to_string())?;
+        // Which port layout the probe chose and what both answered, taken
+        // now because the handle disappears into the engine on the next
+        // line. The service writes it to the event log, so a report from a
+        // machine nobody can test says which path was in use.
+        let ec_report = ec.selection_summary();
         let curve = config.active_curve().map_err(|e| e.to_string())?;
 
         let mut engine = Engine::new(ec, curve);
@@ -431,9 +442,15 @@ impl Host {
                 .and_then(|m| m.modified())
                 .ok(),
             logger: crate::log::Logger::new(crate::log::default_path()),
+            ec_report,
             stop,
             _lock: lock,
         })
+    }
+
+    /// How the controller was reached, for the caller to log. See the field.
+    pub fn ec_report(&self) -> &str {
+        &self.ec_report
     }
 
     /// Tells the host the screen went off, the machine suspended, or it woke.

@@ -21,6 +21,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
+use crate::ec::Probe;
+
 const DEVICE_PATH: &str = r"\\?\GLOBALROOT\Device\PawnIO";
 
 /// PawnIO's device type. Function codes are its own, not Microsoft-assigned.
@@ -39,14 +41,104 @@ const IOCTL_EXECUTE_FN: u32 = ctl_code(DEVICE_TYPE, 0x841, METHOD_BUFFERED, FILE
 /// Execute payload is a fixed-width NUL-padded name followed by u64 cells.
 const FN_NAME_LEN: usize = 32;
 
-/// Module that permits the ACPI EC ports. Shipped alongside us, unmodified,
-/// under LGPL-2.1-or-later. See NOTICE.md.
-pub const MODULE_FILE: &str = "LpcACPIEC.bin";
+/// Every module Yamato ships. Both travel with the executable whatever layout
+/// the machine turns out to have, so an install can be checked for
+/// completeness without opening the driver. Shipped unmodified, under
+/// LGPL-2.1-or-later. See NOTICE.md.
+pub const MODULE_FILES: [&str; 2] =
+    [Layout::Standard.module_file(), Layout::Alternate.module_file()];
 
-/// Ports the stock module allows. Anything else is refused, and the refusal
-/// reads back as 0xff, which is indistinguishable from a stuck EC.
-const EC_STATUS_PORT: u16 = 0x66;
-const EC_DATA_PORT: u16 = 0x62;
+/// The two port layouts ThinkPads keep their embedded controller at, and
+/// everything that differs between them.
+///
+/// Most machines put the ACPI EC at the specified 0x62/0x66. P53-class
+/// machines put it at 0x1600/0x1604 instead, inside an LPC base address
+/// window, and answer nothing at the standard ports. One PawnIO module cannot
+/// serve both: the stock `LpcACPIEC` whitelists exactly 0x62 and 0x66, and
+/// `LpcIO` discovers BAR windows at runtime but discards anything below
+/// 0x100, so it can never permit the standard pair. Two modules, one layout
+/// each, chosen by probing.
+///
+/// The command set is the same on both. Only the addresses and the module
+/// differ, which is why the handshake in ec.rs is written once and
+/// parameterized on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// The ACPI-specified EC ports, 0x62 data and 0x66 status, through the
+    /// stock `LpcACPIEC` module. The path that has been in production.
+    Standard,
+    /// The P53-class window, 0x1600 data and 0x1604 status, through `LpcIO`.
+    Alternate,
+}
+
+impl Layout {
+    /// The module file that permits this layout's ports, looked for beside
+    /// the executable.
+    pub const fn module_file(self) -> &'static str {
+        match self {
+            Layout::Standard => "LpcACPIEC.bin",
+            Layout::Alternate => "LpcIO.bin",
+        }
+    }
+
+    pub const fn status_port(self) -> u16 {
+        match self {
+            Layout::Standard => 0x66,
+            Layout::Alternate => 0x1604,
+        }
+    }
+
+    pub const fn data_port(self) -> u16 {
+        match self {
+            Layout::Standard => 0x62,
+            Layout::Alternate => 0x1600,
+        }
+    }
+
+    /// The module entry points for a byte in and a byte out. Same input and
+    /// output shapes on both modules, different names, and a name the module
+    /// does not export fails the call outright.
+    const fn read_fn(self) -> &'static str {
+        match self {
+            Layout::Standard => "ioctl_pio_read",
+            Layout::Alternate => "ioctl_pio_inb",
+        }
+    }
+
+    const fn write_fn(self) -> &'static str {
+        match self {
+            Layout::Standard => "ioctl_pio_write",
+            Layout::Alternate => "ioctl_pio_outb",
+        }
+    }
+
+    /// Whether driving the EC over this layout also has to hold LpcIO's own
+    /// cross-process mutex. The module documents one for all its operations,
+    /// and OpenRGB and LibreHardwareMonitor honor it, so on the alternate
+    /// path both that and the EC lock apply.
+    pub(crate) const fn uses_isa_lock(self) -> bool {
+        matches!(self, Layout::Alternate)
+    }
+
+    /// The ports this layout is allowed to touch: its own two and nothing
+    /// else. LpcIO itself permits every discovered BAR window, which on a
+    /// P53-class machine is dozens of ports, but nothing in this crate has
+    /// any business outside the EC pair, so the narrower rule is enforced
+    /// here before a request ever reaches the driver.
+    pub fn permits(self, port: u16) -> bool {
+        port == self.status_port() || port == self.data_port()
+    }
+
+    /// One line for logs and error messages. Names the ports and the module,
+    /// which is what a bug report from a machine nobody can test needs to
+    /// contain.
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Layout::Standard => "standard layout (EC at 0x62/0x66 via LpcACPIEC)",
+            Layout::Alternate => "alternate layout (EC at 0x1600/0x1604 via LpcIO)",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -59,7 +151,7 @@ pub enum Error {
     /// The module file is not next to the executable.
     ModuleMissing(PathBuf),
     /// The driver rejected the module. A damaged or unsigned blob does this.
-    ModuleRejected(u32),
+    ModuleRejected { file: &'static str, code: u32 },
     /// A call into a loaded module failed.
     Call { function: &'static str, code: u32 },
     /// Port outside what the loaded module permits.
@@ -67,6 +159,13 @@ pub enum Error {
     /// Another tool is mid-transaction on the controller and did not finish in
     /// time. Refusing is safer than interleaving with it.
     Busy,
+    /// No controller handle could be produced at all. Deliberately not
+    /// returned for a machine that merely failed validation: that machine
+    /// starts on a fallback layout and lets the engine retry, see Ec::open.
+    /// Carries both probes, because the useful diagnostic from a machine
+    /// nobody can test is what each layout returned, not just that both
+    /// failed.
+    NoController(Vec<Probe>),
 }
 
 impl std::fmt::Display for Error {
@@ -83,12 +182,12 @@ impl std::fmt::Display for Error {
                  administrator rights."
             ),
             Error::ModuleMissing(p) => {
-                write!(f, "{} is missing. Expected it at {}", MODULE_FILE, p.display())
+                write!(f, "{} is missing. It is installed alongside Yamato.", p.display())
             }
-            Error::ModuleRejected(code) => write!(
+            Error::ModuleRejected { file, code } => write!(
                 f,
                 "PawnIO rejected {} (error {}). The file may be damaged.",
-                MODULE_FILE, code
+                file, code
             ),
             Error::Call { function, code } => {
                 write!(f, "PawnIO call {} failed with error {}", function, code)
@@ -102,32 +201,71 @@ impl std::fmt::Display for Error {
                 f,
                 "another program is using the embedded controller and did not finish in time"
             ),
+            Error::NoController(probes) => {
+                write!(f, "cannot reach the embedded controller at either port layout.")?;
+                for probe in probes {
+                    write!(f, " {}.", probe)?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// An open handle to PawnIO with our module loaded.
+/// An open handle to PawnIO with one layout's module loaded.
+///
+/// Each handle carries its own module instance inside the driver, so two of
+/// these can exist at once during probing without either seeing the other's
+/// state.
 pub struct PawnIo {
     device: HANDLE,
+    layout: Layout,
 }
 
 // The handle is ours alone and every call is a synchronous ioctl.
 unsafe impl Send for PawnIo {}
 
 impl PawnIo {
-    /// Opens the driver and loads the EC module sitting next to the executable.
-    pub fn open() -> Result<Self, Error> {
-        let module_path = module_path()?;
+    /// Opens the driver and loads the layout's module sitting next to the
+    /// executable.
+    pub fn open_module(layout: Layout) -> Result<Self, Error> {
+        let module_path = module_path(layout.module_file())?;
         let module = std::fs::read(&module_path)
             .map_err(|_| Error::ModuleMissing(module_path.clone()))?;
 
         let device = open_device()?;
-        let this = PawnIo { device };
+        let this = PawnIo { device, layout };
         this.load_module(&module)?;
 
         Ok(this)
+    }
+
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// What LpcIO requires before it will touch a port, in the order it
+    /// requires it: pick the SuperIO register pair, then walk the logical
+    /// devices for base address windows. Port access before both returns
+    /// STATUS_DEVICE_NOT_READY. On the standard layout there is nothing to
+    /// prepare and this is a no-op.
+    ///
+    /// Slot 1, the 0x4e/0x4f pair, not slot 0. Measured on real hardware:
+    /// slot 0 answers with chip ID 0xff, nothing there, while slot 1 carries
+    /// the chip whose BARs include the 0x1600 window. Both EC ports sit in
+    /// that one 8-byte window, so one discovery covers the pair.
+    ///
+    /// The caller must hold the EC lock, which on this layout includes the
+    /// ISA mutex the module documents for these calls.
+    pub(crate) fn prepare(&self) -> Result<(), Error> {
+        if self.layout != Layout::Alternate {
+            return Ok(());
+        }
+
+        self.execute("ioctl_select_slot", &[1], &mut [])?;
+        self.execute("ioctl_find_bars", &[], &mut [])
     }
 
     fn load_module(&self, blob: &[u8]) -> Result<(), Error> {
@@ -146,7 +284,10 @@ impl PawnIo {
         };
 
         if ok == 0 {
-            return Err(Error::ModuleRejected(unsafe { GetLastError() }));
+            return Err(Error::ModuleRejected {
+                file: self.layout.module_file(),
+                code: unsafe { GetLastError() },
+            });
         }
 
         Ok(())
@@ -193,30 +334,26 @@ impl PawnIo {
         Ok(())
     }
 
-    /// True for ports the stock module permits. Ask before probing: a refused
-    /// read returns 0xff, which looks like an EC with both status bits stuck
-    /// set, and costs a full timeout.
-    pub fn port_permitted(port: u16) -> bool {
-        matches!(port, EC_STATUS_PORT | EC_DATA_PORT)
-    }
-
     pub fn read_port(&self, port: u16) -> Result<u8, Error> {
-        if !Self::port_permitted(port) {
+        // Ask before probing: a refused read costs a driver round trip and, on
+        // the standard module, reads back as 0xff, which looks like an EC with
+        // both status bits stuck set and costs a full timeout.
+        if !self.layout.permits(port) {
             return Err(Error::PortNotPermitted(port));
         }
 
         let mut out = [0u64; 1];
-        self.execute("ioctl_pio_read", &[port as u64], &mut out)?;
+        self.execute(self.layout.read_fn(), &[port as u64], &mut out)?;
 
         Ok(out[0] as u8)
     }
 
     pub fn write_port(&self, port: u16, value: u8) -> Result<(), Error> {
-        if !Self::port_permitted(port) {
+        if !self.layout.permits(port) {
             return Err(Error::PortNotPermitted(port));
         }
 
-        self.execute("ioctl_pio_write", &[port as u64, value as u64], &mut [])
+        self.execute(self.layout.write_fn(), &[port as u64, value as u64], &mut [])
     }
 }
 
@@ -261,11 +398,11 @@ fn open_device() -> Result<HANDLE, Error> {
 
 /// Next to the executable, not the working directory. Anything launched from a
 /// run key or by the service manager starts somewhere else.
-fn module_path() -> Result<PathBuf, Error> {
-    let exe = std::env::current_exe().map_err(|_| Error::ModuleMissing(PathBuf::from(MODULE_FILE)))?;
+fn module_path(file: &str) -> Result<PathBuf, Error> {
+    let exe = std::env::current_exe().map_err(|_| Error::ModuleMissing(PathBuf::from(file)))?;
     let dir: &Path = exe.parent().unwrap_or_else(|| Path::new("."));
 
-    Ok(dir.join(MODULE_FILE))
+    Ok(dir.join(file))
 }
 
 #[cfg(test)]
@@ -280,11 +417,40 @@ mod tests {
     }
 
     #[test]
-    fn only_the_acpi_ec_ports_are_permitted() {
-        assert!(PawnIo::port_permitted(0x62));
-        assert!(PawnIo::port_permitted(0x66));
-        // The H8S window some ThinkPads expose. The stock module refuses it.
-        assert!(!PawnIo::port_permitted(0x1600));
-        assert!(!PawnIo::port_permitted(0x1610));
+    fn each_layout_permits_its_own_ports_and_nothing_else() {
+        // The standard pair, and not the H8S window.
+        assert!(Layout::Standard.permits(0x62));
+        assert!(Layout::Standard.permits(0x66));
+        assert!(!Layout::Standard.permits(0x1600));
+        assert!(!Layout::Standard.permits(0x1604));
+
+        // The other way around on the alternate layout. LpcIO itself would
+        // permit every BAR window it found; this crate does not.
+        assert!(Layout::Alternate.permits(0x1600));
+        assert!(Layout::Alternate.permits(0x1604));
+        assert!(!Layout::Alternate.permits(0x62));
+        assert!(!Layout::Alternate.permits(0x66));
+        // Inside a real discovered window, still not the EC pair, still no.
+        assert!(!Layout::Alternate.permits(0x1610));
+    }
+
+    #[test]
+    fn the_layouts_disagree_only_where_the_hardware_does() {
+        // Ports and entry point names differ; both must, together. Crossing
+        // them, the standard ioctl names against the alternate ports or the
+        // reverse, is the mistake this pins down: the call would not fail
+        // loudly, it would fail as an unknown function or a refused port at
+        // the first tick.
+        assert_eq!(Layout::Standard.read_fn(), "ioctl_pio_read");
+        assert_eq!(Layout::Standard.write_fn(), "ioctl_pio_write");
+        assert_eq!(Layout::Alternate.read_fn(), "ioctl_pio_inb");
+        assert_eq!(Layout::Alternate.write_fn(), "ioctl_pio_outb");
+
+        assert_eq!(Layout::Standard.module_file(), "LpcACPIEC.bin");
+        assert_eq!(Layout::Alternate.module_file(), "LpcIO.bin");
+
+        // Only the LpcIO path takes the module's own mutex.
+        assert!(!Layout::Standard.uses_isa_lock());
+        assert!(Layout::Alternate.uses_isa_lock());
     }
 }

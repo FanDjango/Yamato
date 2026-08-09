@@ -22,6 +22,14 @@ fn main() {
         }
     };
 
+    // Which layout won and what both answered, before anything else. This
+    // example is the diagnostic tool for machines the author cannot test, and
+    // the selection evidence is the part a bug report needs most.
+    println!("layout        {}", ec.layout().describe());
+    for probe in ec.selection() {
+        println!("  probed      {probe}");
+    }
+
     if std::env::args().nth(1).as_deref() == Some("bios") {
         match ec.release_to_bios() {
             Ok(()) => println!("fan handed back to the firmware"),

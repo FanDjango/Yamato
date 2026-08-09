@@ -198,7 +198,7 @@ pub(crate) fn run(owner: HWND) -> Option<Result<Outcome, String>> {
 
         summary.push_str(&format!(
             "\n\nThe disengaged fan setting at {} is not something Yamato will run, so it came \
-             across as level 7, the fastest ordinary speed.",
+             across as the firmware step, which hands the fan back to the BIOS.",
             temps.join(", ")
         ));
     }

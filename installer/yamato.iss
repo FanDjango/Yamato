@@ -48,12 +48,17 @@ Name: "trayicon"; Description: "Show the tray icon when I log in"; GroupDescript
 
 [Files]
 Source: "..\dist\{#AppExe}";           DestDir: "{app}"; Flags: ignoreversion
-; The PawnIO module is looked for next to the executable, not in the working
+; The PawnIO modules are looked for next to the executable, not in the working
 ; directory, because a service and a run-key launch both start elsewhere.
+; Both are installed on every machine: LpcACPIEC serves the standard EC ports
+; and LpcIO the 0x1600 window some ThinkPads use instead, and the engine
+; probes for which one this machine needs at startup.
 Source: "..\dist\LpcACPIEC.bin";       DestDir: "{app}"; Flags: ignoreversion
-; The module's source, which the LGPL wants shipped with the object rather
+Source: "..\dist\LpcIO.bin";           DestDir: "{app}"; Flags: ignoreversion
+; The modules' sources, which the LGPL wants shipped with the objects rather
 ; than left at a link somewhere else.
 Source: "..\dist\LpcACPIEC.p";         DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\LpcIO.p";             DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\LICENSE";             DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\LICENSE.LGPL-2.1.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\NOTICE.md";           DestDir: "{app}"; Flags: ignoreversion

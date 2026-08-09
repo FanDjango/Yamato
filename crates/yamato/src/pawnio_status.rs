@@ -99,9 +99,9 @@ pub fn diagnose() -> Missing {
         return Missing::Driver;
     }
 
-    match module_path() {
-        Some(path) if !path.exists() => Missing::Module(path),
-        _ => Missing::Nothing,
+    match first_missing_module() {
+        Some(path) => Missing::Module(path),
+        None => Missing::Nothing,
     }
 }
 
@@ -167,14 +167,20 @@ fn driver_registered() -> bool {
     }
 }
 
-/// Where the PawnIO module should be: beside the executable.
+/// The first PawnIO module that is not beside the executable, if any.
 ///
 /// Next to the binary, not the working directory: a service and a Run-key
-/// launch both start somewhere else.
-fn module_path() -> Option<PathBuf> {
+/// launch both start somewhere else. Both modules are checked, because both
+/// ship: which one the engine ends up needing depends on where this machine
+/// keeps its EC, and the machine that needs the second file is exactly the
+/// one where its absence is fatal.
+fn first_missing_module() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
 
-    Some(exe.with_file_name(yamato_ec::MODULE_FILE))
+    yamato_ec::MODULE_FILES
+        .iter()
+        .map(|file| exe.with_file_name(file))
+        .find(|path| !path.exists())
 }
 
 #[cfg(test)]

@@ -1,26 +1,33 @@
 # Third party components
 
-Yamato is MIT, see `LICENSE`. It ships alongside one component that is
+Yamato is MIT, see `LICENSE`. It ships alongside two components that are
 not ours, listed here.
 
-## LpcACPIEC.bin
+## PawnIO modules: LpcACPIEC.bin and LpcIO.bin
 
-A PawnIO module. It is what permits access to the ACPI embedded controller
-ports 0x62 and 0x66, which is where ThinkPad fan control lives.
+Two PawnIO modules. `LpcACPIEC.bin` permits access to the ACPI embedded
+controller ports 0x62 and 0x66, which is where most ThinkPads keep their fan
+control. `LpcIO.bin` discovers LPC base address windows at runtime, which is
+how Yamato reaches the EC on the machines that keep it at 0x1600/0x1604
+instead. Both are installed on every machine; Yamato probes at startup for
+which one this machine needs.
 
 - Part of PawnIO Modules, Copyright (C) 2023 namazso <admin@namazso.eu>
 - Licensed under the GNU Lesser General Public License, version 2.1 or later
 - `SPDX-License-Identifier: LGPL-2.1-or-later`
 - Full license text: `LICENSE.LGPL-2.1.txt`
-- Source: `LpcACPIEC.p`, shipped alongside it and installed with it
-- Source: <https://github.com/namazso/PawnIO.Modules> (`LpcACPIEC.p`)
+- Sources: `LpcACPIEC.p` and `LpcIO.p`, shipped alongside them and installed
+  with them
+- Source: <https://github.com/namazso/PawnIO.Modules> (`LpcACPIEC.p`,
+  `LpcIO.p`)
 
-The file shipped here is upstream's signed release, byte for byte unmodified.
-Its signature is what the PawnIO driver checks before loading it, so it cannot
-be altered without breaking it.
+The files shipped here are upstream's signed release, byte for byte
+unmodified. Their signatures are what the PawnIO driver checks before loading
+them, so they cannot be altered without breaking them.
 
-It is a separate file loaded at runtime by a driver, not linked into Yamato in
-any form. Replacing it with your own build is a matter of overwriting the file.
+They are separate files loaded at runtime by a driver, not linked into Yamato
+in any form. Replacing either with your own build is a matter of overwriting
+the file.
 
 ## PawnIO
 

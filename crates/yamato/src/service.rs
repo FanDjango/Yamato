@@ -24,7 +24,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::EventLog::{
     DeregisterEventSource, EvtRender, EvtSubscribe, EvtRenderEventXml, EvtSubscribeActionDeliver,
     EvtSubscribeToFutureEvents, RegisterEventSourceW, ReportEventW, EVENTLOG_ERROR_TYPE,
-    EVT_HANDLE, EVT_SUBSCRIBE_NOTIFY_ACTION,
+    EVENTLOG_INFORMATION_TYPE, EVENTLOG_WARNING_TYPE, EVT_HANDLE, EVT_SUBSCRIBE_NOTIFY_ACTION,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -256,24 +256,42 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
 
     match Host::start(config, stop_flag()) {
         Ok(host) => {
+            // Which EC port layout the probe chose and what both answered,
+            // into the application log. This is the only place the choice is
+            // visible from outside the process, and the first question about
+            // any misbehaving machine nobody can test is which path it was on.
+            log_event(
+                EVENTLOG_INFORMATION_TYPE,
+                &format!("Yamato started, {}.", host.ec_report()),
+            );
+
             report(SERVICE_RUNNING, 0);
             run_loop(host);
             report(SERVICE_STOPPED, 0);
         }
-        Err(_) => {
+        Err(reason) => {
             // Nothing can be shown from session 0, and a message box here
             // would hold the service in start-pending until something killed
-            // it. Failing outright is the honest outcome.
+            // it. Failing outright is the honest outcome, and the reason
+            // still goes into the application log. A probed-and-unanswering
+            // controller is deliberately not among the reasons: the engine
+            // starts on a fallback layout and retries instead, so what
+            // remains here is the driver missing or refusing us, a module
+            // file that would not load, or another engine holding the lock.
             //
+            // A warning, not an error, since most arrivals here pass on
+            // their own: the port driver not yet openable during a cold
+            // boot, and a previous process still holding the engine lock
+            // through a fast restart.
+            log_event(EVENTLOG_WARNING_TYPE, &format!("Yamato could not start: {reason}"));
+
             // Reported as a failure rather than a stop, which is what makes
             // the restart actions installed at setup mean anything: an exit
             // code of zero reads as "asked to stop and did", and the service
-            // manager does not retry those. The two ways this arm is reached
-            // both pass on their own: the port driver not yet openable during
-            // a cold boot, and a previous process still holding the engine
-            // lock through a fast restart. Reported as a stop, neither ever
-            // got the second attempt that would have worked, and the machine
-            // ran unmanaged until somebody noticed.
+            // manager does not retry those. Reported as a stop, the
+            // transient failures above never got the second attempt that
+            // would have worked, and the machine ran unmanaged until
+            // somebody noticed.
             report_failure();
         }
     }
@@ -417,10 +435,19 @@ fn run_loop(mut host: Host) {
 }
 
 /// Records a handback that never completed, into the application event log.
-///
-/// Best effort by design. This runs on the way out of a stop that has already
-/// gone wrong, so a failure to log must not become a failure to exit.
 fn log_handback_failure() {
+    log_event(
+        EVENTLOG_ERROR_TYPE,
+        "Yamato could not return the fan to firmware control before stopping. The fan may be held at a fixed level with firmware management disabled. Restart Yamato, or reboot, to restore automatic fan control.",
+    );
+}
+
+/// Writes one line into the application event log.
+///
+/// Best effort by design. Every caller is somewhere a failure to log must not
+/// matter: on the way out of a stop that has already gone wrong, or on the
+/// way into a start whose outcome is decided regardless.
+fn log_event(kind: u16, text: &str) {
     unsafe {
         let source = wide(SERVICE_NAME);
         let handle = RegisterEventSourceW(std::ptr::null(), source.as_ptr());
@@ -428,14 +455,12 @@ fn log_handback_failure() {
             return;
         }
 
-        let text = wide(
-            "Yamato could not return the fan to firmware control before stopping. The fan may be held at a fixed level with firmware management disabled. Restart Yamato, or reboot, to restore automatic fan control.",
-        );
+        let text = wide(text);
         let mut strings = [text.as_ptr()];
 
         ReportEventW(
             handle,
-            EVENTLOG_ERROR_TYPE,
+            kind,
             0,
             1,
             std::ptr::null_mut(),

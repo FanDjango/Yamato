@@ -142,12 +142,16 @@ echo.
 echo Staging dist\...
 if not exist dist mkdir dist
 copy /y target\release\yamato.exe dist\ >nul
-REM The PawnIO module has to sit next to the exe; it is looked for there
+REM The PawnIO modules have to sit next to the exe; they are looked for there
 REM rather than in the working directory, because a service and a Run-key
-REM launch both start somewhere else entirely.
+REM launch both start somewhere else entirely. Both ship on every machine:
+REM which one the engine needs depends on where that machine keeps its EC,
+REM and it decides by probing at startup.
 copy /y assets\LpcACPIEC.bin dist\ >nul
-REM Its source, which the LGPL wants alongside the object it ships with.
+copy /y assets\LpcIO.bin dist\ >nul
+REM Their sources, which the LGPL wants alongside the objects they ship with.
 copy /y assets\LpcACPIEC.p dist\ >nul
+copy /y assets\LpcIO.p dist\ >nul
 copy /y LICENSE dist\ >nul
 copy /y LICENSE.LGPL-2.1.txt dist\ >nul
 copy /y NOTICE.md dist\ >nul
@@ -156,7 +160,7 @@ copy /y THIRD-PARTY-LICENSES.txt dist\ >nul
 for %%F in (dist\yamato.exe) do set SIZE=%%~zF
 echo.
 echo   dist\yamato.exe  (!SIZE! bytes)
-echo   dist\LpcACPIEC.bin
+echo   dist\LpcACPIEC.bin, dist\LpcIO.bin
 echo   dist\LICENSE, LICENSE.LGPL-2.1.txt, NOTICE.md
 echo.
 echo PawnIO is not bundled by design; install it from https://pawnio.eu
