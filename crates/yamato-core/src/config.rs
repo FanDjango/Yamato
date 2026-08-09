@@ -20,7 +20,7 @@ use crate::curve::{Curve, CurveError, CurvePoint};
 use crate::engine::Mode;
 
 /// Bumped whenever the shape changes in a way that needs migrating.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 const DIR_NAME: &str = "Yamato";
 const FILE_NAME: &str = "config.json";
@@ -379,6 +379,62 @@ impl Default for Config {
     }
 }
 
+/// Turns a stored profile of fewer than two points into one that loads.
+///
+/// Only ever called from the migration, which is where the reasoning for
+/// repairing this and nothing else lives.
+fn repair_a_curve_too_short_to_be_one(profile: &mut Profile) {
+    match profile.points.len() {
+        // Nothing stored at all. There is no level to keep and nothing to
+        // extend, so the profile is not saying anything that could be
+        // preserved; it gets the baseline curve, which is the same answer
+        // validate already gives a file that has no profiles in it. Reachable
+        // from a hand-edited file, and from one whose points array was written
+        // empty by something other than this program.
+        0 => {
+            profile.points = Curve::default().points().iter().map(StoredPoint::from).collect();
+        }
+        1 => {
+            // No room for a hotter step above the very top of the range. A lone
+            // point's own temperature decides nothing, because below its first
+            // step a curve holds that step's level, so its level applied at
+            // every temperature wherever the point happened to sit. Moving it
+            // down one degree therefore costs nothing and keeps the level,
+            // which is the part the user chose.
+            if profile.points[0].temp == i8::MAX {
+                profile.points[0].temp -= 1;
+            }
+
+            // The handoff goes at the ceiling, which is where the engine takes
+            // a curve's fan back whatever the curve says. That is the deliberate
+            // choice: at and above the ceiling the engine was already handing
+            // over, and below it the stored level still applies at every
+            // temperature exactly as it did when it was alone, so the repair
+            // adds a step that describes what the machine was doing anyway
+            // rather than inventing a new opinion about the top of the range.
+            // It also lands inside the range the editor draws, so the added
+            // step is visible and movable rather than off the end of the graph.
+            //
+            // The max is for a lone point stored at or above the ceiling:
+            // temperatures have to climb strictly, so the added step has to
+            // clear the one it follows. FAN_BIOS is exempt from the rule that a
+            // hotter step may not run the fan slower, so this is valid whatever
+            // level the lone point asks for.
+            //
+            // No hysteresis, because the engine's own ceiling has none either,
+            // and a few degrees of it here would hold the firmware step below
+            // the ceiling on the way down, which is the one way this repair
+            // could have changed what the fan does.
+            let handoff = crate::engine::SMART_CEILING_C.max(profile.points[0].temp + 1);
+
+            profile.points.push(StoredPoint::from(
+                &CurvePoint::new(handoff, yamato_ec::FAN_BIOS).with_hysteresis(0, 0),
+            ));
+        }
+        _ => {}
+    }
+}
+
 impl Config {
     /// Seconds between decisions for the current power state.
     pub fn poll_interval(&self, in_standby: bool) -> std::time::Duration {
@@ -457,6 +513,37 @@ impl Config {
                 if !self.profiles.iter().any(|p| p.name == built_in.name) {
                     self.profiles.push(built_in);
                 }
+            }
+        }
+
+        // Curves of fewer than two points used to be storable, and are now
+        // refused. Version 1's editor let you delete your way down to one, and
+        // its Curve::new accepted what came back, so files with such a profile
+        // exist in the wild.
+        //
+        // The refusal is right and it stays: one point is one fan level applied
+        // at every temperature there is, with the firmware's own management
+        // switched off because a level is set. What the refusal did to those
+        // files is not right. validate reports the first profile that fails and
+        // the whole load fails with it, and the service loads with
+        // unwrap_or_default, so one stale profile the user had not even
+        // selected threw away every other profile, the poll rate, the startup
+        // mode and the ignored sensors, and the engine ran on the shipped
+        // defaults with nothing said anywhere. A file that will not load is
+        // supposed to be a loud failure, and on the service path it was a
+        // completely silent one.
+        //
+        // So this one case is repaired rather than reported, and it is the only
+        // one. Every other kind of invalid curve is still refused, which is
+        // this module's stated principle. The exception is here because the
+        // alternative is silently discarding everything the user has, which is
+        // worse than the surprise of one curve gaining a step.
+        //
+        // Runs once, like the migration above it, so a curve someone shortens
+        // deliberately afterwards is still their problem to hear about.
+        if self.version < 3 {
+            for profile in &mut self.profiles {
+                repair_a_curve_too_short_to_be_one(profile);
             }
         }
 
@@ -801,6 +888,89 @@ mod tests {
 
         assert!(!is_built_in("Balanced 2"));
         assert!(!is_built_in(""));
+    }
+
+    #[test]
+    fn a_profile_left_with_one_point_does_not_cost_the_user_the_whole_file() {
+        // An older build let a curve be saved with a single point, and this one
+        // refuses to load one. Reported rather than repaired, that took the
+        // whole file down, and the service loads with unwrap_or_default, so one
+        // stale profile nobody had even selected silently replaced every
+        // setting the user had with the shipped defaults.
+        let path = temp_path("onepoint");
+        let json = r#"{
+            "version": 2, "poll_secs": 9, "watchdog_secs": 30,
+            "startup_mode": "bios", "active_profile": "Mine",
+            "ignored_sensors": [3], "standby_poll_secs": 45, "fahrenheit": true,
+            "profiles": [
+                {"name":"Mine","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4},{"temp":88,"level":128,"hyst_up":0,"hyst_down":5}]},
+                {"name":"Old","points":[{"temp":60,"level":3,"hyst_up":0,"hyst_down":4}]}
+            ]
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        let cfg = Config::load(&path).expect("one short curve must not cost the whole file");
+
+        // Everything else is still theirs.
+        assert_eq!(cfg.poll_secs, 9);
+        assert_eq!(cfg.standby_poll_secs, 45);
+        assert_eq!(cfg.startup_mode, StartupMode::Bios);
+        assert_eq!(cfg.active_profile, "Mine");
+        assert_eq!(cfg.ignored_sensors, vec![3usize]);
+        assert!(cfg.fahrenheit);
+        assert_eq!(cfg.profiles.len(), 2);
+
+        // And the short one is a curve now: the level they chose, kept, with a
+        // hotter step handing the fan back to the firmware above it.
+        let repaired = cfg.profiles.iter().find(|p| p.name == "Old").unwrap();
+        assert_eq!(repaired.points.len(), 2);
+        assert_eq!(repaired.points[0].temp, 60);
+        assert_eq!(repaired.points[0].level, 3);
+        assert!(repaired.points[1].temp > repaired.points[0].temp);
+        assert_eq!(repaired.points[1].level, yamato_ec::FAN_BIOS);
+        repaired.to_curve().expect("the repaired profile must be a curve the engine accepts");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_profile_with_no_points_at_all_ends_up_runnable() {
+        // Nothing stored is not a level somebody chose, so there is nothing to
+        // preserve and the baseline curve is the honest answer.
+        let mut cfg = Config::default();
+        cfg.version = 2;
+        cfg.profiles = vec![Profile { name: "Empty".into(), points: Vec::new() }];
+
+        cfg.migrate().unwrap();
+        cfg.validate().expect("an empty profile must not fail the whole file either");
+
+        let curve = cfg.profiles[0].to_curve().unwrap();
+        assert_eq!(curve.points().len(), Curve::default().points().len());
+    }
+
+    #[test]
+    fn a_curve_that_is_wrong_in_some_other_way_is_still_reported_not_repaired() {
+        // The short-curve repair is the one exception, not a license to fix
+        // curves in general. A curve that eases the fan off as the machine
+        // heats is one nobody meant to write, and it is still refused rather
+        // than quietly rearranged into something else.
+        let path = temp_path("backwards");
+        let json = r#"{
+            "version": 2, "poll_secs": 5, "watchdog_secs": 30,
+            "startup_mode": "smart", "active_profile": "X",
+            "profiles": [{"name":"X","points":[{"temp":60,"level":4,"hyst_up":0,"hyst_down":4},{"temp":80,"level":1,"hyst_up":0,"hyst_down":4}]}]
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        match Config::load(&path) {
+            Err(ConfigError::Curve { profile, source }) => {
+                assert_eq!(profile, "X");
+                assert_eq!(source, CurveError::Backwards { index: 1 });
+            }
+            other => panic!("expected a curve error, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

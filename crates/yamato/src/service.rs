@@ -878,6 +878,33 @@ unsafe fn set_restart_on_failure(service: SC_HANDLE) {
         SERVICE_CONFIG_FAILURE_ACTIONS,
         &mut failure as *mut _ as *mut c_void,
     );
+
+    // The actions above are queued for a service that reports SERVICE_STOPPED
+    // with a non-zero exit code only while this flag is on. It is off by
+    // default, and off it means the actions fire only when the process dies
+    // without reporting a stop at all. This service always reports one: the
+    // start that cannot reach the controller ends in report_failure, which sets
+    // SERVICE_STOPPED with error 1066 precisely so the manager would treat it
+    // as a failure. Without the flag the manager recorded the failure and did
+    // nothing about it, so the three restarts sat in the service's recovery
+    // page looking configured while no failure this program can actually have
+    // was ever eligible for them.
+    //
+    // What that cost is a cold boot where the port driver is not openable yet.
+    // The engine fails to start, the service stops, nothing is queued, and the
+    // machine runs with the fan on the firmware's own curve until somebody
+    // notices, when the retry five seconds later would have worked. Same for a
+    // fast restart where the previous process still holds the engine lock.
+    //
+    // report_failure is left as it was. It was already right; it was just not
+    // enough on its own.
+    let mut flag = SERVICE_FAILURE_ACTIONS_FLAG { fFailureActionsOnNonCrashFailures: 1 };
+
+    ChangeServiceConfig2W(
+        service,
+        SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+        &mut flag as *mut _ as *mut c_void,
+    );
 }
 
 /// Starts an installed service. Separate from install, which creates one.
