@@ -23,9 +23,6 @@
 > It refuses the disengaged setting outright, and refuses level 0 as a held
 > manual mode. Use it on hardware you are willing to look after.
 
-Named after IBM's Yamato Lab, where the ThinkPad and the TrackPoint were
-designed.
-
 ---
 
 ## Why
