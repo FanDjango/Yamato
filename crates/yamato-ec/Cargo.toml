@@ -18,4 +18,6 @@ windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_LibraryLoader",
+    # Reading which PawnIO is installed, to hold it to the 2.2.0 floor.
+    "Win32_System_Registry",
 ] }

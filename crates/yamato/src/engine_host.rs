@@ -399,8 +399,12 @@ impl Host {
         // Which port layout the probe chose and what both answered, taken
         // now because the handle disappears into the engine on the next
         // line. The service writes it to the event log, so a report from a
-        // machine nobody can test says which path was in use.
-        let ec_report = ec.selection_summary();
+        // machine nobody can test says which path was in use. The PawnIO
+        // version rides along: a version that could not be read does not
+        // stop startup, so this line is the one place that says the 2.2.0
+        // floor went unchecked.
+        let ec_report =
+            format!("{}. {}", ec.selection_summary(), yamato_ec::driver_version_report());
         let curve = config.active_curve().map_err(|e| e.to_string())?;
 
         let mut engine = Engine::new(ec, curve);

@@ -13,11 +13,14 @@
 //! Without this, the tray said the service was stopped, the user started it,
 //! it died in under a second, and the tray said the service was stopped.
 //!
-//! So the tray asks the installer's question from outside the engine: is the
-//! driver registered, and is the module file where we expect it. A guess, but
-//! a good one, and better than silence.
+//! So the tray asks the installer's questions from outside the engine: is
+//! the driver registered, is it new enough to drive safely, and is the
+//! module file where we expect it. A guess, but a good one, and better than
+//! silence.
 
 use std::path::PathBuf;
+
+use yamato_ec::{DriverVersion, MIN_DRIVER_VERSION};
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
 use windows_sys::Win32::System::Threading::OpenMutexW;
@@ -43,6 +46,10 @@ pub const DOWNLOAD_URL: &str = "https://pawnio.eu";
 pub enum Missing {
     /// The driver is not registered on this machine.
     Driver,
+    /// The driver is there and its version was readable, but it is older
+    /// than the engine will drive: versions before 2.2.0 can crash some
+    /// Windows 10 machines on the first port access.
+    Outdated(DriverVersion),
     /// The driver is there, but the module Yamato hands it is not beside the
     /// executable. An incomplete copy rather than an incomplete install.
     Module(PathBuf),
@@ -57,6 +64,7 @@ impl Missing {
     pub fn short(&self) -> &'static str {
         match self {
             Missing::Driver => "PawnIO is not installed. Right-click to fix it.",
+            Missing::Outdated(_) => "PawnIO is too old. Right-click to update it.",
             Missing::Module(_) => "A file is missing beside Yamato. Right-click for details.",
             Missing::Nothing => "Starting up, or the engine could not reach the controller.",
         }
@@ -71,6 +79,13 @@ impl Missing {
                  PawnIO is a small signed driver, written by someone else, that Yamato \
                  uses to reach the embedded controller. It is not bundled with Yamato, \
                  so it is a separate download.\n\n\
+                 Open the PawnIO download page now?"
+            ),
+            Missing::Outdated(found) => format!(
+                "Yamato cannot control the fan because this PawnIO is too old.\n\n\
+                 PawnIO {found} is installed, and Yamato needs {MIN_DRIVER_VERSION} or \
+                 later: older versions can crash some Windows 10 machines while \
+                 reaching the embedded controller.\n\n\
                  Open the PawnIO download page now?"
             ),
             Missing::Module(path) => format!(
@@ -91,12 +106,22 @@ impl Missing {
 
 /// Looks for the reasons the engine most often cannot start.
 ///
-/// Cheap and side effect free: it opens a registry key and asks whether a file
-/// exists. Nothing here touches the driver, so calling it from a client cannot
-/// interfere with an engine running elsewhere.
+/// Cheap and side effect free: it reads the registry, a file version and
+/// whether a file exists. Nothing here touches the driver, so calling it
+/// from a client cannot interfere with an engine running elsewhere.
 pub fn diagnose() -> Missing {
     if !driver_registered() {
         return Missing::Driver;
+    }
+
+    // The same rule the engine applies before it opens the driver, asked
+    // from outside it: readable and below the floor refuses, unreadable is
+    // not evidence of anything and says nothing. Checked before the module
+    // files, because an old driver explains a dead engine on its own.
+    if let Some((found, _)) = yamato_ec::installed_driver_version() {
+        if found < MIN_DRIVER_VERSION {
+            return Missing::Outdated(found);
+        }
     }
 
     match first_missing_module() {
@@ -194,6 +219,7 @@ mod tests {
         // overran would be truncated into nonsense rather than refused.
         for m in [
             Missing::Driver,
+            Missing::Outdated(DriverVersion::new(2, 0, 0, 0)),
             Missing::Module(PathBuf::from("x")),
             Missing::Nothing,
         ] {
@@ -209,6 +235,16 @@ mod tests {
         // Naming the path is the whole point: "a file is missing" without
         // saying which one leaves someone no better off than silence did.
         assert!(m.explain().contains("LpcACPIEC.bin"));
+    }
+
+    #[test]
+    fn the_outdated_form_names_both_versions() {
+        // The number found and the number needed, because the person
+        // reading this is about to compare them against a download page.
+        let m = Missing::Outdated(DriverVersion::new(2, 0, 0, 0));
+
+        assert!(m.explain().contains("2.0.0"));
+        assert!(m.explain().contains("2.2.0"));
     }
 
     #[test]

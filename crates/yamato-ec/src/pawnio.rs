@@ -22,6 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 use crate::ec::Probe;
+use crate::version::{self, DriverVersion, MIN_DRIVER_VERSION};
 
 const DEVICE_PATH: &str = r"\\?\GLOBALROOT\Device\PawnIO";
 
@@ -142,9 +143,14 @@ impl Layout {
 
 #[derive(Debug)]
 pub enum Error {
-    /// The driver is not installed or not running. The one case where we offer
-    /// a download.
+    /// The driver is not installed or not running. One of the two cases where
+    /// we offer a download.
     DriverUnavailable,
+    /// The driver is installed, its file version was readable, and it is
+    /// older than Yamato can safely drive. The other case where the fix is a
+    /// download, so the message points at the same page. Never produced for
+    /// a version that merely could not be read: see version::verdict.
+    DriverTooOld { found: DriverVersion },
     /// Found the driver but could not open it. Almost always means we are not
     /// elevated.
     AccessDenied,
@@ -175,6 +181,13 @@ impl std::fmt::Display for Error {
                 f,
                 "PawnIO is not installed or not running. Yamato needs it to reach the \
                  embedded controller."
+            ),
+            Error::DriverTooOld { found } => write!(
+                f,
+                "PawnIO {} is installed, and Yamato needs {} or later: older versions \
+                 can crash some Windows 10 machines while reaching the embedded \
+                 controller. Update PawnIO from https://pawnio.eu.",
+                found, MIN_DRIVER_VERSION
             ),
             Error::AccessDenied => write!(
                 f,
@@ -237,6 +250,13 @@ impl PawnIo {
 
         let device = open_device()?;
         let this = PawnIo { device, layout };
+
+        // Only after the driver opened, so an absent driver reports as
+        // absent rather than as a version problem it does not have. Checked
+        // before any module runs, because the crash the floor exists to stop
+        // happens on port access.
+        version::enforce_minimum()?;
+
         this.load_module(&module)?;
 
         Ok(this)
@@ -414,6 +434,17 @@ mod tests {
         // Verified against a working C++ client.
         assert_eq!(IOCTL_LOAD_BINARY, 0xA1B2_2084);
         assert_eq!(IOCTL_EXECUTE_FN, 0xA1B2_2104);
+    }
+
+    #[test]
+    fn the_too_old_error_names_the_version_and_the_fix() {
+        // Whoever reads this error is going to a download page to look for
+        // a number, so both numbers and the page have to be in it.
+        let message = Error::DriverTooOld { found: DriverVersion::new(2, 0, 0, 0) }.to_string();
+
+        assert!(message.contains("2.0.0"), "{message}");
+        assert!(message.contains("2.2.0"), "{message}");
+        assert!(message.contains("https://pawnio.eu"), "{message}");
     }
 
     #[test]

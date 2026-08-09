@@ -104,6 +104,13 @@ Filename: "{app}\{#AppExe}"; Description: "Start Yamato now"; \
 ; executable that is no longer there.
 
 [Code]
+// The version floor, split the way VS_FIXEDFILEINFO carries it. PawnIO
+// before 2.2.0 can blue-screen Windows 10 1809, 19H1 and 19H2 on port
+// access, and 1809 is a version Yamato supports.
+const
+  MinPawnIoMS = $00020002; // 2.2, major in the high word
+  MinPawnIoLS = $00000000; // .0.0
+
 // PawnIO is deliberately not bundled. It is GPL-2.0, so redistributing the
 // driver would oblige us to ship its source; pointing at the download does
 // not. It is also not ours to sign for.
@@ -112,6 +119,71 @@ var
   Ignored: Cardinal;
 begin
   Result := RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\PawnIO', 'Type', Ignored);
+end;
+
+// Where the service registration says the driver binary is. The value
+// usually reads '\SystemRoot\...', the kernel's spelling of the Windows
+// directory, which nothing user-mode can open until it is translated.
+function PawnIoSysPath(): String;
+var
+  Raw: String;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\PawnIO',
+                             'ImagePath', Raw) then
+    Exit;
+
+  if Pos('\systemroot\', Lowercase(Raw)) = 1 then
+    Result := ExpandConstant('{win}') + '\' + Copy(Raw, Length('\SystemRoot\') + 1, Length(Raw))
+  else if Pos('\??\', Raw) = 1 then
+    Result := Copy(Raw, Length('\??\') + 1, Length(Raw))
+  else if Pos('system32\', Lowercase(Raw)) = 1 then
+    Result := ExpandConstant('{win}') + '\' + Raw
+  else
+    Result := Raw;
+end;
+
+// The installed PawnIO's file version. Read from the driver binary itself,
+// the file the old crash lives in; failing that, from PawnIOLib.dll in
+// PawnIO's install directory, which carries the same release version.
+// PawnIO's own version query is deliberately not used: it tracks the API,
+// not the release, and still answers 2.0.0 on a current 2.2.0 install.
+function PawnIoVersion(var MS, LS: Cardinal): Boolean;
+var
+  Path: String;
+begin
+  Result := False;
+
+  Path := PawnIoSysPath();
+  if (Path <> '') and FileExists(Path) then
+    Result := GetVersionNumbers(Path, MS, LS);
+
+  if not Result then
+  begin
+    if not RegQueryStringValue(HKLM,
+        'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO',
+        'InstallLocation', Path) then
+      Path := ExpandConstant('{commonpf}\PawnIO');
+    Path := AddBackslash(Path) + 'PawnIOLib.dll';
+
+    if FileExists(Path) then
+      Result := GetVersionNumbers(Path, MS, LS);
+  end;
+end;
+
+// Readable and below the floor. An unreadable version is not evidence of an
+// old one, so it never refuses; the engine applies the same rule when it
+// starts, and logs when the check could not be made.
+function PawnIoTooOld(var Found: String): Boolean;
+var
+  MS, LS: Cardinal;
+begin
+  Result := False;
+  if PawnIoVersion(MS, LS) then
+  begin
+    Found := Format('%d.%d.%d', [MS shr 16, MS and $FFFF, LS shr 16]);
+    Result := (MS < MinPawnIoMS) or ((MS = MinPawnIoMS) and (LS < MinPawnIoLS));
+  end;
 end;
 
 // Stops a running service before any file is replaced.
@@ -145,6 +217,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   Response: Integer;
   ErrorCode: Integer;
+  Found: String;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -154,6 +227,19 @@ begin
         'Yamato needs PawnIO to reach the embedded controller.' + #13#13 +
         'PawnIO is a small signed driver, made by someone else, that Yamato ' +
         'talks to. It is not bundled here, so it is a separate download.' + #13#13 +
+        'Open the PawnIO download page now?',
+        mbConfirmation, MB_YESNO);
+
+      if Response = IDYES then
+        ShellExec('open', 'https://pawnio.eu', '', '', SW_SHOW, ewNoWait, ErrorCode);
+    end
+    else if PawnIoTooOld(Found) then
+    begin
+      Response := MsgBox(
+        'Yamato needs PawnIO 2.2.0 or later, and this machine has ' + Found + '.' + #13#13 +
+        'PawnIO versions before 2.2.0 can crash some Windows 10 machines ' +
+        'while reaching the embedded controller, so Yamato will not run ' +
+        'with this one.' + #13#13 +
         'Open the PawnIO download page now?',
         mbConfirmation, MB_YESNO);
 

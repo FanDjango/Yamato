@@ -195,24 +195,40 @@ log, re-read without a restart if you'd rather use a text editor.
 ## Requirements
 
 - Windows 10 1809 or later, 64-bit. Windows 11 included.
-- A ThinkPad whose embedded controller answers on the usual ACPI ports
-- [PawnIO][pawnio], installed separately
+- A ThinkPad
+- [PawnIO][pawnio] 2.2.0 or later, installed separately. Versions before
+  2.2.0 can crash some Windows 10 machines while reaching the controller, so
+  Yamato and its installer both check.
 
-On models: Yamato talks to the embedded controller at ports `0x62` and `0x66`,
-which is where the ACPI specification puts it and where ThinkPads have had it
-for a very long time. Confirmed working on a P1 Gen 7. TPFanControl's own
-testing covers T430 and X230T on those same ports.
+On models: ThinkPads keep their embedded controller in one of two places.
+Most answer at ports `0x62` and `0x66`, where the ACPI specification puts the
+interface. Some, the P53 among them, answer instead through a window at
+`0x1600`. That window is not one machine's quirk: it is ThinkPad's own
+controller interface, mapped to LPC channel 3 of the Renesas H8S chips the
+ECs are built on, and Linux's [tp_smapi][tpsmapi] has driven the EC through
+`0x1600`/`0x1604` for twenty years. ThinkWiki documents it under
+[Embedded Controller Firmware][thinkwiki-ec].
 
-That is the whole of what is known. TPFanCtrl2 carries a second set of
-addresses, `0x1600`/`0x1604`, found on a P53, and probes that pair first, so on
-any machine where it answers the standard ports were never tried. Whether those
-models also respond at `0x62`/`0x66` is simply untested, and no year or product
-line predicts it: a P53 and a P1 Gen 7 are five years apart in the same range.
+Yamato handles both. At every start it probes both layouts and drives the one
+where a controller demonstrably answers, so there is no setting and nothing
+to know about your model. To be plain about what is proven: the standard
+ports are confirmed on hardware, a P1 Gen 7 here plus the T430 and X230T
+covered by TPFanControl's own testing. The `0x1600` window is confirmed
+reachable, measured four independent ways on a P1 Gen 7, but that machine
+keeps its controller at the standard ports, and no machine that actually
+lives at `0x1600` has run Yamato yet. If yours does, the application event
+log records which layout was chosen and why, and a report either way is
+welcome.
 
-Trying it costs nothing. The PawnIO module refuses any port other than those
-two, so a machine that keeps its controller elsewhere gets no reading and a
-tray icon saying the controller cannot be reached. There is no address it could
-write to by mistake.
+Probing the layout a machine doesn't use is safe by construction. Each layout
+runs through its own PawnIO module, and each module bounds what can be
+touched. The standard one permits exactly ports `0x62` and `0x66`. The one
+for the `0x1600` window opens only the port windows the machine itself
+declares, which on the ThinkPad where they were measured came to 68 ports of
+the 65,536 possible, and it can never permit anything below `0x100`, where
+the legacy system hardware lives. Yamato holds itself narrower than either:
+whichever layout wins, it addresses that layout's two ports and refuses its
+own requests for anything else.
 
 The hard floor is 1703. That's when `SetProcessDpiAwarenessContext` appeared,
 and it's linked statically, so anything older won't start at all rather than
@@ -223,7 +239,11 @@ Neither is worth caring about, so 1809 is the number to go by.
 
 Yamato does not bundle PawnIO. It's GPL-2.0, and shipping the driver would
 mean shipping its source; pointing at the download doesn't. The installer
-checks for it and offers to open the page, and the tray keeps a link to it.
+checks that it is there and new enough and offers to open the page, and the
+tray keeps a link to it.
+
+One known conflict: FACEIT's anti-cheat blocks PawnIO, and there is nothing
+Yamato can do about that from its side.
 
 ## How it is put together
 
@@ -279,11 +299,20 @@ does, and a fan held off indefinitely with the firmware switched out of the
 loop is a different thing entirely. That floor is in the engine, at the point
 where a command arrives.
 
-`0x40` runs the blower unregulated. It is documented as potentially unsupported
-and damaging, it is extremely loud, and it does not cool better than level 7 in
-practice. That one is refused everywhere a level can enter: curve validation,
-config loading, the editor's axis, and the channel. No curve, no saved file
-and no message can produce it.
+`0x40` runs the blower unregulated, past the speed the firmware governs it
+to. Yamato refuses it everywhere a level can enter: curve validation, config
+loading, the editor's axis, and the channel. No curve, no saved file and no
+message can produce it.
+
+That is a decision, not a gap. TPFanControl offers the disengaged mode and
+some people use it deliberately, knowing what it does. It is documented as
+potentially unsupported and damaging, and in practice it does not cool much
+better than level 7, so Yamato's judgment is that running a fan past its
+governor is not something this program should do. An imported TPFanControl
+curve that uses it comes across with the firmware step in its place, and the
+import says so when that happens. If the disengaged mode is what you need,
+TPFanControl and its forks do it well, and they are linked at the top of
+this file.
 
 ## Building
 
@@ -319,4 +348,6 @@ LGPL-2.1-or-later, shipped unmodified. See [NOTICE.md](NOTICE.md).
 [fandjango]: https://github.com/FanDjango/TPFanCtrl2
 [pawnio]: https://pawnio.eu
 [acpi]: https://www.kernel.org/doc/html/latest/admin-guide/laptops/thinkpad-acpi.html
+[tpsmapi]: https://github.com/linux-thinkpad/tp_smapi/blob/master/thinkpad_ec.c
+[thinkwiki-ec]: https://www.thinkwiki.org/wiki/Embedded_Controller_Firmware
 [byrnes]: https://github.com/byrnes/TPFanControl

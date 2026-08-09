@@ -23,8 +23,12 @@
 mod ec;
 mod lock;
 mod pawnio;
+mod version;
 
 pub use ec::{
     Ec, EcState, Probe, FAN_BIOS, FAN_BITS, FAN_DISENGAGED, FAN_LEVEL_MAX, SENSOR_COUNT,
 };
 pub use pawnio::{Error, Layout, PawnIo, MODULE_FILES};
+pub use version::{
+    driver_version_report, installed_driver_version, DriverVersion, MIN_DRIVER_VERSION,
+};

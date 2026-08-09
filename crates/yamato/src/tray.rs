@@ -1128,11 +1128,10 @@ impl Tray {
             // to read what it is. Hiding it while it worked meant the only
             // route to it appeared exactly when somebody was least able to go
             // hunting for a menu item.
-            let missing = pawnio_status::diagnose();
-            let pawnio_label = if missing == pawnio_status::Missing::Nothing {
-                "PawnIO driver..."
-            } else {
-                "Yamato needs PawnIO - click to fix"
+            let pawnio_label = match pawnio_status::diagnose() {
+                pawnio_status::Missing::Nothing => "PawnIO driver...",
+                pawnio_status::Missing::Outdated(_) => "PawnIO needs an update - click to fix",
+                _ => "Yamato needs PawnIO - click to fix",
             };
 
             AppendMenuW(menu, MF_STRING, ID_PAWNIO, wide(pawnio_label).as_ptr());

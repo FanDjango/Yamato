@@ -403,9 +403,14 @@ impl Ec {
                     opened.push(ec);
                     probes.push(probe);
                 }
-                // The driver being absent or refusing us stops both layouts
-                // equally, so there is nothing to learn from probing on.
-                Err(e @ (Error::DriverUnavailable | Error::AccessDenied)) => return Err(e),
+                // The driver being absent, refusing us, or too old to drive
+                // safely stops both layouts equally, so there is nothing to
+                // learn from probing on.
+                Err(
+                    e @ (Error::DriverUnavailable
+                    | Error::AccessDenied
+                    | Error::DriverTooOld { .. }),
+                ) => return Err(e),
                 // The module would not load: missing beside the executable,
                 // or rejected by the driver. Recorded as evidence, and kept
                 // in case it was the fallback layout's module, where it
