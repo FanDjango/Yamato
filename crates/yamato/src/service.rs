@@ -47,6 +47,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// it also is, but here it is the one needed to remove a service.
 const DELETE: u32 = 0x0001_0000;
 
+/// Says "the code that matters is in dwServiceSpecificExitCode". Any non-zero
+/// exit is what makes the manager treat a stop as a failure worth retrying.
+const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
+
 // Not bound by windows-sys 0.59, so declared here. This is what tells us the
 // machine is heading into standby on hardware that has no S3 to suspend to.
 #[link(name = "user32")]
@@ -254,15 +258,45 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         Ok(host) => {
             report(SERVICE_RUNNING, 0);
             run_loop(host);
+            report(SERVICE_STOPPED, 0);
         }
         Err(_) => {
             // Nothing can be shown from session 0, and a message box here
             // would hold the service in start-pending until something killed
             // it. Failing outright is the honest outcome.
+            //
+            // Reported as a failure rather than a stop, which is what makes
+            // the restart actions installed at setup mean anything: an exit
+            // code of zero reads as "asked to stop and did", and the service
+            // manager does not retry those. The two ways this arm is reached
+            // both pass on their own: the port driver not yet openable during
+            // a cold boot, and a previous process still holding the engine
+            // lock through a fast restart. Reported as a stop, neither ever
+            // got the second attempt that would have worked, and the machine
+            // ran unmanaged until somebody noticed.
+            report_failure();
         }
     }
+}
 
-    report(SERVICE_STOPPED, 0);
+/// Reports a stop the service manager should act on.
+///
+/// A specific code, because a generic one is indistinguishable from the
+/// service having been asked to stop.
+fn report_failure() {
+    let Some(handle) = STATUS_HANDLE.get() else { return };
+
+    let mut status = SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: SERVICE_STOPPED,
+        dwControlsAccepted: 0,
+        dwWin32ExitCode: ERROR_SERVICE_SPECIFIC_ERROR,
+        dwServiceSpecificExitCode: 1,
+        dwCheckPoint: 0,
+        dwWaitHint: 0,
+    };
+
+    unsafe { SetServiceStatus(*handle as SERVICE_STATUS_HANDLE, &mut status) };
 }
 
 /// Drives the host, applying power state changes the handler recorded.
@@ -444,6 +478,13 @@ unsafe extern "system" fn control_handler(
                 let guid = &setting.PowerSetting;
 
                 if same_guid(guid, &GUID_CONSOLE_DISPLAY_STATE) {
+                    // A screen coming on is the other end of a standby
+                    // session, and a more reliable one than the log entry,
+                    // since it is broadcast rather than rendered and searched.
+                    if value != 0 {
+                        IN_MODERN_STANDBY.store(false, Ordering::SeqCst);
+                    }
+
                     // 0 off, 1 on, 2 dimmed. A screen that has gone off is
                     // where Modern Standby begins, and it is also a docked
                     // laptop working with its lid shut. Recorded as what it
@@ -488,6 +529,12 @@ unsafe extern "system" fn control_handler(
             // display state stands until the display itself says otherwise.
             PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
                 SUSPENDING.store(false, Ordering::SeqCst);
+                // A resume ends a standby session whether or not its own end
+                // was logged. Event 507 is the ordinary way out, but it is one
+                // rendered string away from being missed, and a missed one
+                // would leave the engine in firmware mode at the standby poll
+                // rate for the rest of the session with nothing saying why.
+                IN_MODERN_STANDBY.store(false, Ordering::SeqCst);
                 publish_power();
                 signal_control_event();
             }

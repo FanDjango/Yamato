@@ -245,8 +245,11 @@ Level=90 128 0 7
 
     #[test]
     fn the_firmware_step_is_recognized() {
-        let found = parse_tpfancontrol_ini("Level=80 128 0 4\n").unwrap();
-        assert!(found[0].curve.points()[0].is_bios());
+        // Two steps, because one is not a curve: a lone point holds its level
+        // at every temperature with the firmware switched off, and the loader
+        // refuses it however it arrived.
+        let found = parse_tpfancontrol_ini("Level=50 1 0 4\nLevel=80 128 0 4\n").unwrap();
+        assert!(found[0].curve.points()[1].is_bios());
     }
 
     #[test]

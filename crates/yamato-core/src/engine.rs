@@ -105,6 +105,15 @@ impl Drop for FanGuard {
 /// and defaults to around here.
 pub const MANUAL_ESCAPE_C: i8 = 80;
 
+/// Where the firmware takes a curve's fan back, whatever the curve says.
+///
+/// Above this a curve has stopped being an opinion worth having: the three
+/// that ship hand the fan over at 88, 90 and 93, so one still deciding at 95
+/// has been cut down to something that no longer covers the top of the range.
+/// Higher than the manual escape on purpose, because a curve is watching the
+/// temperature and a held level is not.
+pub const SMART_CEILING_C: i8 = 95;
+
 /// How long the loop may go without a decision before the fan is handed back.
 ///
 /// A stall means something is wrong, and a loud laptop is the safe failure.
@@ -227,6 +236,24 @@ impl Engine {
             }
             Mode::Manual(level) => level.min(yamato_ec::FAN_LEVEL_MAX),
             Mode::Smart => match hottest {
+                // The curve is trusted right up to the point where trusting it
+                // stops being defensible.
+                //
+                // A curve is not required to end by handing the fan back, and
+                // below its first step and above its last it holds that step's
+                // level. Delete every point but the first of the shipped
+                // Balanced curve, whose first step is level 0, and the result
+                // is a valid curve that runs the fan at nothing whatever the
+                // temperature, with the firmware's own management switched off
+                // because a level is set. The watchdog does not catch it: the
+                // loop is not stalled, it is doing exactly as it was told.
+                //
+                // Rather than refuse such a curve, which would stop a
+                // hand-edited file and an imported ini from loading at all,
+                // the firmware takes over above a temperature no sane curve is
+                // still deciding at. The three that ship hand back at 88, 90
+                // and 93, so none of them ever reaches this.
+                Some((_, temp)) if temp >= SMART_CEILING_C => FAN_BIOS,
                 Some((_, temp)) => {
                     let step = self.curve.evaluate(temp, self.step);
                     self.step = Some(step);

@@ -460,13 +460,15 @@ impl Host {
         // happened, so a resume does not read as sleep the moment it lands.
         self.sleep_clock.forget();
 
-        // A mode decision made here outranks a pending recovery. Leaving it
-        // set meant a wake could restore the user's curve and then have the
-        // recovery flip it straight back to firmware three ticks later.
-        self.clear_surrender();
-
         match power {
-            PowerState::Awake => self.take_the_fan_back_from_standby(),
+            PowerState::Awake => {
+                // A wake outranks a pending recovery. Leaving it set meant a
+                // wake could restore the user's curve and then have the
+                // recovery flip it straight back to firmware three ticks
+                // later.
+                self.clear_surrender();
+                self.take_the_fan_back_from_standby();
+            }
             PowerState::ScreenOff | PowerState::Suspended => self.hand_to_firmware_for_standby(),
         }
     }
@@ -478,8 +480,23 @@ impl Host {
         // one episode, and the second pass through here must not save BIOS
         // mode over what the user actually had.
         if !self.standby_handback {
-            self.standby_mode = Some(self.engine.mode().clone());
+            // A pending fault recovery knows better than the current mode
+            // does. The current mode is BIOS precisely because the fault put
+            // it there, so saving that would quietly turn a temporary
+            // surrender into the thing restored on wake, which is the
+            // "five transient failures cost the user their curve" regression
+            // the recovery exists to prevent.
+            self.standby_mode =
+                Some(self.surrendered.clone().unwrap_or_else(|| self.engine.mode().clone()));
         }
+
+        // Taken over, not left running alongside. Both paths end in BIOS mode,
+        // but only this one knows the machine is asleep: a recovery left
+        // pending would count three good passes during standby and restore a
+        // manual level onto a laptop shut in a bag, with the firmware's own
+        // management off and nothing further to undo it, because the handback
+        // below has already happened and does not repeat.
+        self.clear_surrender();
 
         self.standby_handback = true;
         self.engine.set_mode(Mode::Bios);
@@ -566,7 +583,16 @@ impl Host {
     }
 
     /// Undoes a standby handback, restoring whatever mode was in force before.
+    ///
+    /// Does nothing when there was no handback to undo. Waking used to reset
+    /// the mode to whatever the settings said to start in, which is not what
+    /// a wake means: choose a fixed level with the lid shut, plug the charger
+    /// back in, and the choice silently became Smart again.
     fn take_the_fan_back_from_standby(&mut self) {
+        if !self.standby_handback {
+            return;
+        }
+
         self.standby_handback = false;
 
         let mode = self
@@ -574,6 +600,12 @@ impl Host {
             .take()
             .unwrap_or_else(|| Mode::from(self.config.startup_mode));
 
+        // No longer holding a fan we could not give back: whatever the last
+        // handback did, this is a deliberate decision to manage it again, and
+        // leaving the warning up would make the one alarm that has to stay
+        // credible into a permanent fixture. It is set again the moment
+        // another handback fails.
+        self.handback_failed = false;
         self.engine.set_mode(mode);
     }
 
@@ -1004,6 +1036,11 @@ impl Host {
         // new choice recorded rather than the old one.
         self.standby_handback = false;
         self.standby_mode = None;
+
+        // A deliberate instruction also ends the failed-handback warning. It
+        // says a level may be held with the firmware switched off, and from
+        // here the mode is whatever was just asked for, managed by us.
+        self.handback_failed = false;
 
         self.engine.set_mode(mode);
     }

@@ -56,6 +56,8 @@ pub enum CurveError {
     NotAscending { index: usize },
     /// A step that runs the fan slower than the one below it.
     Backwards { index: usize },
+    /// One point, which is one level held at every temperature there is.
+    TooFewPoints { count: usize },
     /// Levels above 7 that are not the firmware handoff. In practice, 0x40,
     /// which disengages the fan governor and is documented as potentially
     /// damaging.
@@ -66,6 +68,10 @@ impl std::fmt::Display for CurveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CurveError::Empty => write!(f, "a curve needs at least one point"),
+            CurveError::TooFewPoints { count } => write!(
+                f,
+                "a curve of {count} point holds one fan level at every temperature, with the firmware's own control switched off; it needs at least two"
+            ),
             CurveError::Backwards { index } => write!(
                 f,
                 "point {index} runs the fan slower than the point below it, so the fan                  would ease off as the machine gets hotter"
@@ -96,6 +102,24 @@ impl Curve {
             return Err(CurveError::Empty);
         }
 
+        // A curve of one point is not a curve. Below its first step a curve
+        // holds that step's level and above its last it holds that one, so a
+        // single point applies one level at every temperature there is, with
+        // the firmware's own management switched off because a level is set.
+        // Make that point level 0 and the fan is off at 100 degrees; the
+        // shipped Balanced curve starts at level 0, so deleting its other
+        // points is all it takes.
+        //
+        // Refused here rather than in the editor, because the editor is not
+        // the only way in: a hand-edited config.json and an imported ini reach
+        // the engine without passing through it. A file like that is reported
+        // and the engine will not start on it, which is the loud failure this
+        // trades for a silent one.
+        //
+        // Checked after the per-point rules below, not before, so that a lone
+        // point asking for the disengaged level is reported as what it is
+        // rather than as a curve that happens to be short.
+
         for (i, p) in points.iter().enumerate() {
             if p.level > FAN_LEVEL_MAX && !p.is_bios() {
                 return Err(CurveError::IllegalLevel { index: i, level: p.level });
@@ -121,6 +145,10 @@ impl Curve {
             {
                 return Err(CurveError::Backwards { index: i });
             }
+        }
+
+        if points.len() < 2 {
+            return Err(CurveError::TooFewPoints { count: points.len() });
         }
 
         Ok(Curve { points })
@@ -229,6 +257,45 @@ mod tests {
         // On step 2 (70 C, drop at 65). 66 is not far enough down.
         assert_eq!(c.evaluate(66, Some(2)), 2);
         assert_eq!(c.evaluate(65, Some(2)), 1);
+    }
+
+    #[test]
+    fn a_single_point_is_refused_however_it_arrives() {
+        // Not a curve: one level applied at every temperature there is, with
+        // the firmware's own management switched off because a level is set.
+        // The shipped Balanced curve starts at level 0, so deleting its other
+        // points would leave the fan off at 100 degrees.
+        //
+        // Checked here rather than only in the editor, because a hand-edited
+        // config.json and an imported ini both reach the engine without
+        // passing through it.
+        assert!(matches!(
+            Curve::new(vec![CurvePoint::new(50, 0)]),
+            Err(CurveError::TooFewPoints { count: 1 })
+        ));
+        assert!(matches!(
+            Curve::new(vec![CurvePoint::new(50, FAN_BIOS)]),
+            Err(CurveError::TooFewPoints { count: 1 })
+        ));
+
+        // Two is enough to be a curve, and still has to satisfy the rest.
+        assert!(Curve::new(vec![CurvePoint::new(50, 0), CurvePoint::new(80, FAN_BIOS)]).is_ok());
+    }
+
+    #[test]
+    fn the_firmware_takes_over_above_the_ceiling_whatever_the_curve_says() {
+        // A curve is not required to end by handing the fan back, and above
+        // its last step it holds that step's level. The three that ship hand
+        // over at 88, 90 and 93, so none of them ever reaches the ceiling.
+        for profile in [Curve::default()] {
+            let hottest = profile.points().last().expect("a curve has points");
+            assert!(
+                hottest.is_bios() || hottest.temp < crate::engine::SMART_CEILING_C,
+                "a shipped curve is still deciding at the ceiling"
+            );
+        }
+
+        assert!(crate::engine::SMART_CEILING_C > crate::engine::MANUAL_ESCAPE_C);
     }
 
     #[test]

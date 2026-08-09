@@ -593,7 +593,7 @@ mod tests {
         let json = r#"{
             "version": 99, "poll_secs": 5, "watchdog_secs": 30,
             "startup_mode": "smart", "active_profile": "X",
-            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4}]}]
+            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4},{"temp":88,"level":128,"hyst_up":0,"hyst_down":5}]}]
         }"#;
         std::fs::write(&path, json).unwrap();
 
@@ -636,7 +636,7 @@ mod tests {
             "version": 2, "poll_secs": 5, "watchdog_secs": 30,
             "startup_mode": "smart", "active_profile": "X",
             "standby": "keep-control", "standby_poll_secs": 30,
-            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4}]}]
+            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4},{"temp":88,"level":128,"hyst_up":0,"hyst_down":5}]}]
         }"#;
         std::fs::write(&path, json).unwrap();
 
@@ -661,7 +661,7 @@ mod tests {
         let json = r#"{
             "version": 1, "poll_secs": 5, "watchdog_secs": 30,
             "startup_mode": "smart", "active_profile": "X",
-            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4}]}]
+            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4},{"temp":88,"level":128,"hyst_up":0,"hyst_down":5}]}]
         }"#;
         std::fs::write(&path, json).unwrap();
 
@@ -771,7 +771,9 @@ mod tests {
     fn a_profile_someone_named_themselves_is_not_overwritten_by_the_migration() {
         // Somebody's own curve called Quiet is theirs. Adding a built-in over
         // the top of it would replace tuning with a default and say nothing.
-        let mine = Curve::new(vec![CurvePoint::new(70, 4)]).unwrap();
+        let mine =
+            Curve::new(vec![CurvePoint::new(70, 4), CurvePoint::new(85, yamato_ec::FAN_BIOS)])
+                .unwrap();
 
         let mut old = Config::default();
         old.version = 1;
@@ -780,7 +782,8 @@ mod tests {
         old.migrate().unwrap();
 
         let kept = old.profiles.iter().find(|p| p.name == "Quiet").unwrap();
-        assert_eq!(kept.points.len(), 1, "the built-in replaced a user's curve");
+        assert_eq!(kept.points.len(), 2, "the built-in replaced a user's curve");
+        assert_eq!(kept.points[0].temp, 70, "the built-in replaced a user's curve");
     }
 
     #[test]
@@ -930,7 +933,7 @@ mod tests {
         let json = r#"{
             "version": 1, "poll_secs": 5, "watchdog_secs": 30,
             "startup_mode": "smart", "active_profile": "X",
-            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4}]}]
+            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4},{"temp":88,"level":128,"hyst_up":0,"hyst_down":5}]}]
         }"#;
         std::fs::write(&path, json).unwrap();
 
@@ -1031,7 +1034,7 @@ mod tests {
         let json = r#"{
             "version": 1, "poll_secs": 5, "watchdog_secs": 30,
             "startup_mode": "smart", "active_profile": "X",
-            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4}]}]
+            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4},{"temp":88,"level":128,"hyst_up":0,"hyst_down":5}]}]
         }"#;
         std::fs::write(&path, json).unwrap();
 

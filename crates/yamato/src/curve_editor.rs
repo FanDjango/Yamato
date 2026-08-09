@@ -368,10 +368,16 @@ impl Editor {
         true
     }
 
-    /// Removes a point. The last one cannot go: a curve with no points is not
-    /// a curve, and the engine would have nothing to follow.
+    /// Removes a point, down to a floor of two.
+    ///
+    /// Two, not one. Below its first step a curve holds that step's level and
+    /// above its last it holds that one, so a single point applies one level
+    /// at every temperature, with the firmware's own management switched off
+    /// because a level is set. The loader refuses such a curve, and an editor
+    /// able to build one would be an editor that saves a file you cannot then
+    /// start on.
     pub fn remove_point(&mut self, index: usize) -> bool {
-        if self.points.len() <= 1 || index >= self.points.len() {
+        if self.points.len() <= 2 || index >= self.points.len() {
             return false;
         }
 
@@ -544,11 +550,19 @@ mod tests {
     }
 
     #[test]
-    fn the_last_point_cannot_be_removed() {
-        // An empty curve would leave the engine with nothing to follow.
-        let mut e = Editor::new(&Curve::new(vec![CurvePoint::new(50, 1)]).unwrap());
-        assert!(!e.remove_point(0));
-        assert_eq!(e.points().len(), 1);
+    fn a_curve_cannot_be_cut_below_two_points() {
+        // One point is one level held at every temperature, with the firmware
+        // switched off because a level is set. The loader refuses such a
+        // curve, so the editor must not be able to build one and save it.
+        let curve =
+            Curve::new(vec![CurvePoint::new(50, 1), CurvePoint::new(80, yamato_ec::FAN_BIOS)])
+                .unwrap();
+        let mut e = Editor::new(&curve);
+
+        assert!(!e.remove_point(0), "cutting to one point was allowed");
+        assert!(!e.remove_point(1), "cutting to one point was allowed");
+        assert_eq!(e.points().len(), 2);
+        assert!(e.validate().is_ok());
     }
 
     #[test]
@@ -584,7 +598,11 @@ mod tests {
     fn a_new_first_point_takes_after_the_one_above_it() {
         // There is nothing below it to copy, and the alternative is the same
         // silent mixing at the other end of the curve.
-        let curve = Curve::new(vec![CurvePoint::new(60, 2).with_hysteresis(3, 8)]).unwrap();
+        let curve = Curve::new(vec![
+            CurvePoint::new(60, 2).with_hysteresis(3, 8),
+            CurvePoint::new(85, yamato_ec::FAN_BIOS).with_hysteresis(1, 5),
+        ])
+        .unwrap();
         let mut e = Editor::new(&curve);
         let a = area();
 
