@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/yamato-ec", "crates/yamato-core", "crates/yamato"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["David Brustein <david@brustein.net>"]
+repository = "https://github.com/mackid1993/yamato"
+rust-version = "1.75"
+
+[workspace.dependencies]
+windows-sys = "0.59"
+
+# Small, quiet binaries. This is a tray utility that sits resident all day, so
+# size and working set matter more than a few percent of throughput.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# NOT panic = "abort": a panic must still unwind so the guard that hands the
+# fan back to the BIOS gets to run. A pinned fan level with nothing driving it
+# is a thermal hazard, not just a crash.
+panic = "unwind"

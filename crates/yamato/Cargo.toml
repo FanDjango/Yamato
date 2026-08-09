@@ -1,0 +1,71 @@
+[package]
+name = "yamato"
+description = "Fan control software for ThinkPads, with a tray icon and a real curve editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+yamato-core = { path = "../yamato-core" }
+yamato-ec = { path = "../yamato-ec" }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    # Reporting a failed fan handback on the way out of a stop.
+    # EnableWindow/SetFocus, for the modal name box.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_EventLog",
+    "Win32_System_Services",
+    "Win32_System_Power",
+    "Win32_System_Console",
+    "Win32_System_SystemServices",
+    # GetLocalTime, for stamping the history file.
+    "Win32_System_SystemInformation",
+    # QueryInterruptTime and QueryUnbiasedInterruptTime, which between them say
+    # how much of an interval the machine spent asleep.
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
+    # GetOpenFileNameW, for picking a TPFanControl ini to import.
+    # OleInitialize: the shell wants an apartment on the thread that talks to
+    # it, and this one runs the file dialog and ShellExecute.
+    "Win32_System_Ole",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_HiDpi",
+] }
+
+# Direct2D and DirectWrite are COM, and windows-sys has no COM support at all.
+# Hand-rolling the vtable calls would be hundreds of lines of unsafe for the
+# same result. Both crates are compile-time bindings, so this costs nothing at
+# runtime; the DLLs ship with Windows either way.
+windows = { version = "0.58", features = [
+    # The brush and geometry methods are gated on this, which is not an
+    # obvious place to look for them.
+    "Foundation_Numerics",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    # D2D's render-target types live behind this gate, not an obvious place.
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+] }
+
+[build-dependencies]
+winresource = "0.1.31"

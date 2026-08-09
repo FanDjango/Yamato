@@ -1,0 +1,11 @@
+# Build output
+/target/
+/dist/
+
+# Cargo.lock is committed: this is an application, not a library, and pinning
+# the exact dependency versions is what makes a build reproducible.
+
+# Editor noise
+.vs/
+.vscode/
+*.user

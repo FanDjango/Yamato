@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="Yamato - fan control software for ThinkPads">
+  <title>Yamato</title>
+
+  <defs>
+    <!-- The dome, lit from up and left, exactly as the icon script draws it. -->
+    <radialGradient id="cap" cx="36%" cy="30%" r="78%">
+      <stop offset="0%"   stop-color="#ff6e6e"/>
+      <stop offset="55%"  stop-color="#ce1b22"/>
+      <stop offset="100%" stop-color="#68060a"/>
+    </radialGradient>
+
+    <!-- A gloss laid over the top, the same shape the icon uses. -->
+    <radialGradient id="gloss" cx="38%" cy="24%" r="46%">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.47"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- The window ground, with the same faint top light the program uses. -->
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#171a22"/>
+      <stop offset="100%" stop-color="#0f1116"/>
+    </linearGradient>
+
+
+
+    <clipPath id="capclip">
+      <circle cx="170" cy="150" r="88"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1200" height="300" fill="url(#ground)"/>
+
+  <!-- The mark. -->
+  <g>
+    <circle cx="170" cy="150" r="88" fill="url(#cap)"/>
+
+
+
+    <circle cx="170" cy="150" r="88" fill="url(#gloss)"/>
+    <!-- The dark rim, which is what makes it read as a cap and not a disc. -->
+    <circle cx="170" cy="150" r="87" fill="none" stroke="#68060a" stroke-width="3" stroke-opacity="0.85"/>
+  </g>
+
+  <!-- The wordmark. System faces only: this has to render the same on a
+       machine that has never heard of us, which rules out a webfont. -->
+  <text x="310" y="163"
+        font-family="Segoe UI Variable Display, Segoe UI, Inter, system-ui, sans-serif"
+        font-size="96" font-weight="600" letter-spacing="-1" fill="#e8eaf0">Yamato</text>
+
+  <text x="316" y="212"
+        font-family="Segoe UI Variable Text, Segoe UI, Inter, system-ui, sans-serif"
+        font-size="30" font-weight="400" fill="#99a0ae">Fan control software for ThinkPads</text>
+
+  <!-- A curve, because that is the thing this program is. Levels stepping up
+       and then handing back to the firmware at the top, which is the shape of
+       every good curve in it. -->
+  <g stroke="#ce1b22" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round" opacity="0.75">
+    <path d="M 860 232 L 906 232 L 906 208 L 952 208 L 952 182 L 998 182 L 998 152 L 1044 152 L 1044 118 L 1090 118 L 1090 84 L 1136 84"/>
+  </g>
+  <g fill="#ff6e6e" opacity="0.9">
+    <circle cx="906" cy="232" r="5"/>
+    <circle cx="952" cy="208" r="5"/>
+    <circle cx="998" cy="182" r="5"/>
+    <circle cx="1044" cy="152" r="5"/>
+    <circle cx="1090" cy="118" r="5"/>
+  </g>
+</svg>
