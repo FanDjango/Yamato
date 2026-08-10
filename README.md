@@ -23,6 +23,21 @@
 > It refuses the disengaged setting outright, and refuses level 0 as a held
 > manual mode. Use it on hardware you are willing to look after.
 
+> **A hobby project. Issues and pull requests are closed, and there is no
+> support.** It was written for one ThinkPad and shared because it may suit
+> yours. If it doesn't work for you, it doesn't work for you.
+>
+> That is the honest version rather than an unfriendly one. Reaching an
+> embedded controller depends on hardware that varies by model and by firmware
+> revision, and answering "it doesn't work on my machine" properly means owning
+> that machine. Promising otherwise would set an expectation this cannot meet.
+>
+> It's MIT licensed, so fork it and do as you like. And
+> [TPFanControl][tpfc] and [its forks][fandjango] have done this well for
+> twenty years, are actively maintained, and support more machines than this
+> does. If Yamato doesn't suit your ThinkPad, they are the better answer, not
+> a consolation prize.
+
 ---
 
 ## Why
