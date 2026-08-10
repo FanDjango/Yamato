@@ -115,6 +115,12 @@ pub struct Settings {
     /// Captured during the draw, not computed twice, because a second copy of
     /// the layout arithmetic is a second thing to get out of step.
     profile_row: std::cell::Cell<(f32, f32, f32, f32)>,
+    mode_row: std::cell::Cell<(f32, f32, f32, f32)>,
+    /// Whether the pointer is over each of those, so they light up the way
+    /// the picker does. Without it the accent text is the only thing saying
+    /// these rows are live, and a color alone reads as decoration.
+    profile_hot: std::cell::Cell<bool>,
+    mode_hot: std::cell::Cell<bool>,
     /// Where the Save button was last drawn, for the same reason.
     save_button: std::cell::Cell<(f32, f32, f32, f32)>,
     /// Where Discard was last drawn, and empty while there is nothing to
@@ -217,6 +223,10 @@ pub struct Readout {
     pub hottest: Option<(usize, i8)>,
     pub fan_rpm: [u16; 2],
     pub mode: &'static str,
+    /// The same thing as one of the `ipc::MODE_` values. The string above is
+    /// for reading; this is for deciding, and clicking the Mode row needs to
+    /// know what it is switching away from without matching on prose.
+    pub mode_raw: u8,
     pub profile: String,
     pub fault: bool,
     /// Which kind of trouble, as one of the `ipc::STATUS_` values. Zero when
@@ -762,6 +772,9 @@ impl Settings {
                 window,
                 tray_window,
                 profile_row: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
+                mode_row: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
+                profile_hot: std::cell::Cell::new(false),
+                mode_hot: std::cell::Cell::new(false),
                 save_button: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 discard_button: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 picker_box: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
@@ -825,6 +838,41 @@ impl Settings {
     /// Switching profiles here saves the curve on screen first. Without that,
     /// edits made since the window opened would be silently discarded by the
     /// switch, which is a surprising way to lose work.
+    /// Clicking the Mode row moves the fan between the firmware's control and
+    /// the curve.
+    ///
+    /// Two stops, not three. A fixed level is the one mode that switches the
+    /// firmware's thermal management off and holds it off, and nothing in this
+    /// program arrives at that by cycling: the tray asks for a level from a
+    /// submenu and no hotkey sets one at all, on purpose. So a click from
+    /// Manual lands on the curve, which is the direction that gives
+    /// management back rather than the one that takes it away.
+    ///
+    /// A command rather than a config write, because the mode is the engine's
+    /// to hold: the file says what to start in, not what is running now.
+    fn cycle_mode(&mut self) {
+        let next = match self.readout.mode_raw {
+            crate::ipc::MODE_BIOS => crate::ipc::MODE_SMART,
+            _ => crate::ipc::MODE_BIOS,
+        };
+
+        let Some(channel) = crate::ipc::Channel::attach() else {
+            return;
+        };
+
+        // The empty name is "leave the profile alone". Which curve is
+        // selected is not a statement about who should drive the fan.
+        channel.post_command(next, 0, "");
+
+        // Show it now rather than a poll later, so the row answers the click
+        // it was given. The next readout from the engine overwrites this with
+        // the truth, which is the point: if the command did not take, the row
+        // goes back on its own instead of lying until something else changes.
+        self.readout.mode_raw = next;
+        self.readout.mode = if next == crate::ipc::MODE_SMART { "Smart" } else { "BIOS" };
+        self.invalidate();
+    }
+
     fn show_profile_menu(&mut self) {
         // The menu below runs a loop of its own that dispatches for every
         // window on the thread, and this call already holds a `&mut Settings`.
@@ -1575,6 +1623,46 @@ impl Settings {
     }
 
     /// One key-value row: muted label on the left, right-aligned value.
+    /// The hover highlight behind a key-value row that answers a click.
+    ///
+    /// The same wash the profile picker uses, so the two clickable things in
+    /// this panel light up the same way. Drawn before the row rather than
+    /// inside `kv_row`, because the rows that are only readings share that
+    /// function and must not gain a highlight they cannot honor.
+    ///
+    /// Inset by a couple of DIPs and rounded, so it reads as the row lighting
+    /// up rather than a band drawn across the panel. The bounds are the ones
+    /// the click is tested against, so what lights up is what is live.
+    fn row_wash(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+        left: f32,
+        right: f32,
+        y: f32,
+        height: f32,
+        hot: bool,
+    ) -> Result<()> {
+        if !hot {
+            return Ok(());
+        }
+
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: left - theme::SPACE_SM,
+                top: y + 1.0,
+                right: right + theme::SPACE_SM,
+                bottom: y + height - 1.0,
+            },
+            radiusX: theme::RADIUS,
+            radiusY: theme::RADIUS,
+        };
+
+        let wash = self.brush(target, D2D1_COLOR_F { a: 0.10, ..theme::ACCENT })?;
+        unsafe { target.FillRoundedRectangle(&rounded, &wash) };
+
+        Ok(())
+    }
+
     fn kv_row(
         &self,
         target: &ID2D1HwndRenderTarget,
@@ -2460,10 +2548,23 @@ impl Settings {
         // Given up to whichever row the pointer is over, because a row that
         // reads "Standby poll  30 s" tells nobody what it is for, and this is
         // the only line of prose within reach of it.
-        let hint = match self.hot_knob.get().and_then(|i| KNOBS.get(i)) {
-            Some(knob) => knob.describe(),
-            None => {
-                "Click a value to change it. Right-click a sensor to leave it out of the decision."
+        // The two live rows in the readout column borrow it too. They are the
+        // only clickable things in this window with no label saying so, and
+        // an accent color and a highlight tell somebody that a row does
+        // something without telling them what.
+        // Kept to the two lines this box holds. A fixed level is not
+        // mentioned because clicking cannot reach one: that is the tray's
+        // submenu, and on purpose.
+        let hint = if self.mode_hot.get() {
+            "Click Mode to hand the fan to the firmware, or back to your curve."
+        } else if self.profile_hot.get() {
+            "Click Profile to switch curves, or to add, rename or delete one."
+        } else {
+            match self.hot_knob.get().and_then(|i| KNOBS.get(i)) {
+                Some(knob) => knob.describe(),
+                None => {
+                    "Click a value to change it. Right-click a sensor to leave it out of the decision."
+                }
             }
         };
 
@@ -2588,6 +2689,7 @@ impl Settings {
             // clickable either. Rectangles left over from the last healthy
             // paint would answer a click in what is now empty panel.
             self.profile_row.set((0.0, 0.0, 0.0, 0.0));
+            self.mode_row.set((0.0, 0.0, 0.0, 0.0));
             self.sensor_rows.set((0.0, 0.0, 0.0, 0.0));
 
             // A fault is a state, not a crash. Centered, calm, and it says
@@ -2694,10 +2796,15 @@ impl Settings {
 
         self.kv_row(target, cl, cr, y, row, "Fan", &fan, theme::TEXT)?;
         y += row;
-        self.kv_row(target, cl, cr, y, row, "Mode", self.readout.mode, theme::TEXT)?;
+        // Accent, and a rectangle recorded, for the same reason Profile has
+        // both: this row answers a click.
+        self.row_wash(target, cl, cr, y, row, self.mode_hot.get())?;
+        self.kv_row(target, cl, cr, y, row, "Mode", self.readout.mode, theme::ACCENT)?;
+        self.mode_row.set((cl, y, cr, y + row));
         y += row;
         // Drawn in the accent color, because unlike its neighbors this row
         // does something when clicked.
+        self.row_wash(target, cl, cr, y, row, self.profile_hot.get())?;
         self.kv_row(target, cl, cr, y, row, "Profile", &self.readout.profile, theme::ACCENT)?;
         self.profile_row.set((cl, y, cr, y + row));
         y += row + theme::SPACE_SM;
@@ -2961,6 +3068,12 @@ unsafe extern "system" fn wnd_proc(
                     return LRESULT(0);
                 }
 
+                let (ml, mt, mr, mb) = this.mode_row.get();
+                if mr > ml && x >= ml && x <= mr && y >= mt && y <= mb {
+                    this.cycle_mode();
+                    return LRESULT(0);
+                }
+
                 let (dl, dt, dr, db) = this.discard_button.get();
                 if dr > dl && x >= dl && x <= dr && y >= dt && y <= db {
                     this.discard_edits();
@@ -3020,6 +3133,22 @@ unsafe extern "system" fn wnd_proc(
                 if hot != this.picker_hot.get() {
                     this.picker_hot.set(hot);
                     this.invalidate();
+                }
+
+                // The two readout rows that answer a click, by the same rule
+                // and against the same rectangles the click is tested with.
+                // An empty rectangle is the fault state, where nothing
+                // clickable is drawn, and a zero-width test never matches.
+                for (rect, flag) in
+                    [(this.mode_row.get(), &this.mode_hot), (this.profile_row.get(), &this.profile_hot)]
+                {
+                    let (l, t, r, b) = rect;
+                    let over = r > l && x >= l && x <= r && y >= t && y <= b;
+
+                    if over != flag.get() {
+                        flag.set(over);
+                        this.invalidate();
+                    }
                 }
 
                 // Same rule for the settings rows, whose description takes

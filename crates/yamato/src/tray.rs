@@ -955,6 +955,7 @@ impl Tray {
                             ipc::MODE_MANUAL => "Manual",
                             _ => "BIOS",
                         },
+                        mode_raw: s.mode,
                         profile: s.read_profile(),
                         fault: s.fault != 0,
                         status: s.status,
