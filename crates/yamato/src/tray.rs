@@ -725,6 +725,12 @@ impl Tray {
             )
         });
 
+        // And whether to suggest the other controller mode. The judgment is
+        // the engine's, made on the fault run it already counts; the tray
+        // only carries the sentence, so a machine that needs Compatibility
+        // mode stops looking identical to one that is not supported at all.
+        let layout_hint = self.channel.as_ref().map_or(0, |c| c.get().layout_hint);
+
         // The third of these is the number that goes in the icon, when there is
         // one to show.
         let (band, tip, reading) = match &self.channel {
@@ -735,11 +741,17 @@ impl Tray {
                 // very differently to whoever is looking at the icon, and one
                 // of them wants acting on.
                 if let Some((headline, detail)) = ipc::status_words(s.status, s.fault != 0) {
-                    // The hint takes the detail's line rather than a fourth
+                    // A hint takes the detail's line rather than a fourth
                     // line of its own: the tip is 128 characters hard, and of
-                    // the two sentences the hint is the one that leads
-                    // somewhere.
-                    let detail = if hint { ipc::SINGLE_FAN_HINT } else { detail };
+                    // the sentences on offer a hint is the one that leads
+                    // somewhere. The single-fan hint first: it rests on
+                    // declined writes, which means a controller answering,
+                    // so the two cannot honestly apply at once.
+                    let detail = if hint {
+                        ipc::SINGLE_FAN_HINT
+                    } else {
+                        ipc::layout_hint_words(layout_hint).unwrap_or(detail)
+                    };
 
                     (3, format!("Yamato\n{headline}\n{detail}"), None)
                 } else {
@@ -835,8 +847,9 @@ impl Tray {
                 // cannot open the controller and exits in under a second, so
                 // the manager correctly reports it stopped, and telling
                 // somebody to start a service that will die again is a loop
-                // with no way out.
-                let why = match pawnio_status::diagnose() {
+                // with no way out. This arm only runs with no engine
+                // attached, so the diagnosis is the strict one.
+                let why = match pawnio_status::diagnose(false) {
                     pawnio_status::Missing::Nothing => match service::state() {
                         -1 => "No engine installed. Right-click to install the service.",
                         state if state != SERVICE_RUNNING => {
@@ -930,6 +943,7 @@ impl Tray {
                         fault: s.fault != 0,
                         status: s.status,
                         single_fan_hint: hint,
+                        layout_hint,
                     }
                 },
             ));
@@ -1127,8 +1141,10 @@ impl Tray {
             // to be findable at any time: to install it, to reinstall it, or
             // to read what it is. Hiding it while it worked meant the only
             // route to it appeared exactly when somebody was least able to go
-            // hunting for a menu item.
-            let pawnio_label = match pawnio_status::diagnose() {
+            // hunting for a menu item. An attached engine softens the module
+            // check: a file the running engine never needed is not a fault to
+            // pin the menu with.
+            let pawnio_label = match pawnio_status::diagnose(self.channel.is_some()) {
                 pawnio_status::Missing::Nothing => "PawnIO driver...",
                 pawnio_status::Missing::Outdated(_) => "PawnIO needs an update - click to fix",
                 _ => "Yamato needs PawnIO - click to fix",
@@ -1592,7 +1608,7 @@ impl Tray {
     /// send anyone, since it came from an incomplete copy of Yamato and not a
     /// missing driver, so it says so and stops.
     fn offer_pawnio(&mut self) {
-        let missing = pawnio_status::diagnose();
+        let missing = pawnio_status::diagnose(self.channel.is_some());
         let _pause = TimerPause::new(self.window);
 
         if let pawnio_status::Missing::Module(_) = missing {

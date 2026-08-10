@@ -109,7 +109,12 @@ impl Missing {
 /// Cheap and side effect free: it reads the registry, a file version and
 /// whether a file exists. Nothing here touches the driver, so calling it
 /// from a client cannot interfere with an engine running elsewhere.
-pub fn diagnose() -> Missing {
+///
+/// `engine_running` is whether an engine is publishing right now, which the
+/// tray knows from its channel. It matters to the module check alone: this
+/// diagnosis is a guess made from outside the engine, and an engine that is
+/// running has settled the one question the guess exists to answer.
+pub fn diagnose(engine_running: bool) -> Missing {
     if !driver_registered() {
         return Missing::Driver;
     }
@@ -124,7 +129,7 @@ pub fn diagnose() -> Missing {
         }
     }
 
-    match first_missing_module() {
+    match module_problem(engine_running, missing_modules()) {
         Some(path) => Missing::Module(path),
         None => Missing::Nothing,
     }
@@ -192,20 +197,46 @@ fn driver_registered() -> bool {
     }
 }
 
-/// The first PawnIO module that is not beside the executable, if any.
+/// The PawnIO modules that are not beside the executable.
 ///
 /// Next to the binary, not the working directory: a service and a Run-key
 /// launch both start somewhere else. Both modules are checked, because both
 /// ship: which one the engine ends up needing depends on where this machine
 /// keeps its EC, and the machine that needs the second file is exactly the
 /// one where its absence is fatal.
-fn first_missing_module() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+fn missing_modules() -> Vec<PathBuf> {
+    let Ok(exe) = std::env::current_exe() else { return Vec::new() };
 
     yamato_ec::MODULE_FILES
         .iter()
         .map(|file| exe.with_file_name(file))
-        .find(|path| !path.exists())
+        .filter(|path| !path.exists())
+        .collect()
+}
+
+/// Whether the missing module files amount to a problem worth reporting, and
+/// which file to name if so.
+///
+/// A missing module is only a real problem when it is the one this machine
+/// needs, and only the engine knows which that is. So the running engine gets
+/// the benefit of the doubt: it loaded the module it needed, or it would not
+/// be running, and an absent file it never asked for is not worth a warning
+/// pinned to the tray forever. This is what happens when somebody upgrades by
+/// copying a new yamato.exe over an old install that never shipped the second
+/// module: the engine works, and the tray used to say "Yamato needs PawnIO -
+/// click to fix" for the rest of time.
+///
+/// No engine, no benefit of the doubt. A machine whose recorded layout needs
+/// the missing module fails to start over exactly that file, so every absence
+/// is reported, same as always. Both files gone is reported even beside a
+/// running engine, because that engine cannot survive its next restart and
+/// the reinstall the message asks for is the fix either way.
+fn module_problem(engine_running: bool, missing: Vec<PathBuf>) -> Option<PathBuf> {
+    if engine_running && missing.len() < yamato_ec::MODULE_FILES.len() {
+        return None;
+    }
+
+    missing.into_iter().next()
 }
 
 #[cfg(test)]
@@ -251,6 +282,42 @@ mod tests {
     fn diagnosing_is_safe_to_call_anywhere() {
         // No panic, whatever this machine happens to have installed. The tray
         // calls it from a menu handler, where a panic would take the icon out.
-        let _ = diagnose();
+        let _ = diagnose(false);
+        let _ = diagnose(true);
+    }
+
+    #[test]
+    fn a_running_engine_outranks_a_missing_module_it_never_needed() {
+        // The partial-upgrade case: a new yamato.exe copied over an install
+        // that never shipped LpcIO.bin. The engine starts and drives the fan;
+        // a permanent "click to fix" over the file it did not need was the
+        // tray lying about a machine that works.
+        let lpcio = vec![PathBuf::from("LpcIO.bin")];
+
+        assert_eq!(module_problem(true, lpcio.clone()), None);
+
+        // Without a running engine the guess reverts to strict: the missing
+        // file may be exactly why there is no engine, and saying so is the
+        // whole point of this module.
+        assert_eq!(module_problem(false, lpcio), Some(PathBuf::from("LpcIO.bin")));
+    }
+
+    #[test]
+    fn a_healthy_install_and_a_gutted_one_read_the_same_with_or_without_an_engine() {
+        // Nothing missing is never a problem to invent.
+        for running in [false, true] {
+            assert_eq!(module_problem(running, Vec::new()), None);
+        }
+
+        // Every module gone is a problem even beside a running engine: it
+        // cannot survive its next restart, and the answer, reinstall, is the
+        // same message either way.
+        let both = vec![PathBuf::from("LpcACPIEC.bin"), PathBuf::from("LpcIO.bin")];
+        for running in [false, true] {
+            assert_eq!(
+                module_problem(running, both.clone()),
+                Some(PathBuf::from("LpcACPIEC.bin"))
+            );
+        }
     }
 }

@@ -132,11 +132,13 @@ impl Layout {
 
     /// One line for logs and error messages. Names the ports and the module,
     /// which is what a bug report from a machine nobody can test needs to
-    /// contain.
+    /// contain. "Compatibility mode" is the name the settings row uses for
+    /// the alternate layout, so a log line and the control it points at
+    /// cannot drift apart.
     pub const fn describe(self) -> &'static str {
         match self {
-            Layout::Standard => "standard layout (EC at 0x62/0x66 via LpcACPIEC)",
-            Layout::Alternate => "alternate layout (EC at 0x1600/0x1604 via LpcIO)",
+            Layout::Standard => "standard mode (EC at 0x62/0x66 via LpcACPIEC)",
+            Layout::Alternate => "compatibility mode (EC at 0x1600/0x1604 via LpcIO)",
         }
     }
 }

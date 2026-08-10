@@ -65,11 +65,12 @@ const DEFAULT_HEIGHT: f32 = 720.0;
 /// longer fits its panel; and the heading meets the profile picker. Getting
 /// below it is meant to be impossible, not merely discouraged.
 ///
-/// The height went up by a row's worth when the settings column gained its
-/// eighth row: at the old minimum the column's closing caption ran out of the
-/// bottom of its panel, and a minimum the layout overflows at is not a minimum.
+/// The height has gone up by a row's worth each time the settings column
+/// gained a row, the eighth and then the ninth: at the old minimum the
+/// column's closing caption ran out of the bottom of its panel, and a minimum
+/// the layout overflows at is not a minimum.
 const MIN_WIDTH: f32 = 900.0;
-const MIN_HEIGHT: f32 = 624.0;
+const MIN_HEIGHT: f32 = 648.0;
 
 /// Room kept for the heading, so the picker beside it never takes the width
 /// the words need.
@@ -228,6 +229,12 @@ pub struct Readout {
     /// whether the second fan has ever once reported a speed. This window
     /// only shows the conclusion.
     pub single_fan_hint: bool,
+    /// The controller mode worth suggesting, as one of the
+    /// `ipc::LAYOUT_HINT_` values, or zero for nothing. The engine owns this
+    /// judgment: it knows which mode it is driving, why, and how long the
+    /// controller has been out of reach. This window only shows the
+    /// sentence.
+    pub layout_hint: u8,
 }
 
 /// Sensor names, in the order the controller reports them. The same layout
@@ -253,10 +260,16 @@ pub enum Knob {
     Logging,
     ShowWindow,
     SingleFan,
+    EcLayout,
 }
 
 /// The rows, in the order they are drawn.
-pub const KNOBS: [Knob; 8] = [
+///
+/// Controller mode is last on purpose: it is the advanced override for which
+/// ports reach the embedded controller, set once by the first boot's probe
+/// and then never an everyday setting, and it should not sit among the rows
+/// people actually visit.
+pub const KNOBS: [Knob; 9] = [
     Knob::Poll,
     Knob::Watchdog,
     Knob::Escape,
@@ -265,6 +278,7 @@ pub const KNOBS: [Knob; 8] = [
     Knob::Logging,
     Knob::ShowWindow,
     Knob::SingleFan,
+    Knob::EcLayout,
 ];
 
 /// Poll intervals worth offering. Fine grained where it matters, because the
@@ -302,6 +316,7 @@ impl Knob {
             Knob::Logging => "Logging",
             Knob::ShowWindow => "Open at start",
             Knob::SingleFan => "Fans",
+            Knob::EcLayout => "Controller mode",
         }
     }
 
@@ -336,6 +351,9 @@ impl Knob {
             Knob::SingleFan => {
                 "Whether this machine has a second fan. Set Single if fan 2 never reports a speed."
             }
+            Knob::EcLayout => {
+                "Advanced. Applies at the next start. The wrong mode stops fan control."
+            }
         }
     }
 
@@ -359,6 +377,15 @@ impl Knob {
             Knob::Logging => if config.log_enabled { "On" } else { "Off" }.to_string(),
             Knob::ShowWindow => if config.show_window_on_start { "Window" } else { "Tray only" }.to_string(),
             Knob::SingleFan => if config.single_fan { "Single" } else { "Dual" }.to_string(),
+            // A file the probe has not decided yet shows Standard, which is
+            // where almost every machine lives and what the engine falls
+            // back to; the service writes the real answer at its first
+            // start, normally long before this window first opens.
+            Knob::EcLayout => match config.ec_layout {
+                Some(yamato_core::EcLayout::Compat) => "Compatibility",
+                _ => "Standard",
+            }
+            .to_string(),
         }
     }
 
@@ -410,6 +437,17 @@ impl Knob {
             // honest default; the config field explains why this is asked of
             // a person instead of guessed from the hardware.
             Knob::SingleFan => config.single_fan = !config.single_fan,
+            // Between the two concrete modes, always: this row is an
+            // override, not a reset, and it writes an answer the engine
+            // drives at its next start without validating it away. A file
+            // the probe has not decided yet reads as Standard, so the first
+            // click shows Compatibility, matching what the row displayed.
+            Knob::EcLayout => {
+                config.ec_layout = Some(match config.ec_layout {
+                    Some(yamato_core::EcLayout::Compat) => yamato_core::EcLayout::Standard,
+                    _ => yamato_core::EcLayout::Compat,
+                });
+            }
         }
 
         config.watchdog_secs = config
@@ -2560,11 +2598,20 @@ impl Settings {
 
             // Under the detail, not instead of it, which is the luxury the
             // tooltip does not have. Drawn in the accent because unlike the
-            // sentences above it, this one names a way out.
-            if self.readout.single_fan_hint {
+            // sentences above it, this one names a way out. The single-fan
+            // hint first, same as the tooltip: it rests on declined writes,
+            // which means a controller answering, so the two cannot honestly
+            // apply at once.
+            let way_out = if self.readout.single_fan_hint {
+                Some(crate::ipc::SINGLE_FAN_HINT)
+            } else {
+                crate::ipc::layout_hint_words(self.readout.layout_hint)
+            };
+
+            if let Some(way_out) = way_out {
                 self.text(
                     target,
-                    crate::ipc::SINGLE_FAN_HINT,
+                    way_out,
                     D2D_RECT_F { left: cl, top: mid + 48.0, right: cr, bottom: mid + 92.0 },
                     &self.axis,
                     theme::ACCENT_BRIGHT,
@@ -3102,6 +3149,7 @@ mod tests {
                 assert_eq!(back.startup_mode, config.startup_mode);
                 assert_eq!(back.log_enabled, config.log_enabled);
                 assert_eq!(back.single_fan, config.single_fan);
+                assert_eq!(back.ec_layout, config.ec_layout, "{knob:?} moved the layout");
             }
         }
 
@@ -3151,13 +3199,58 @@ mod tests {
     fn the_two_state_rows_go_back_as_well_as_forward() {
         let mut config = yamato_core::Config::default();
 
-        for knob in [Knob::StartIn, Knob::Logging, Knob::SingleFan] {
+        for knob in [Knob::StartIn, Knob::Logging, Knob::SingleFan, Knob::EcLayout] {
             let before = knob.value(&config);
             knob.cycle(&mut config);
             assert_ne!(knob.value(&config), before, "{knob:?} did not change");
             knob.cycle(&mut config);
             assert_eq!(knob.value(&config), before, "{knob:?} did not come back");
         }
+    }
+
+    #[test]
+    fn the_controller_mode_row_is_the_last_thing_anyone_scrolls_past() {
+        // An advanced override for which ports reach the controller has no
+        // business sitting among the everyday rows, so it stays at the end.
+        assert_eq!(KNOBS.last(), Some(&Knob::EcLayout));
+    }
+
+    #[test]
+    fn the_controller_mode_row_is_an_override_between_the_two_real_modes() {
+        // A fresh file the probe has not decided reads as Standard, because
+        // that is where almost every machine lives; the first click flips it
+        // to Compatibility, and from there it only ever cycles between the
+        // two concrete answers. There is deliberately no third state: the
+        // probe runs once, at the first start, and this row exists to
+        // overrule it, not to re-ask it.
+        let mut config = yamato_core::Config::default();
+        assert_eq!(config.ec_layout, None);
+        assert_eq!(Knob::EcLayout.value(&config), "Standard");
+
+        Knob::EcLayout.cycle(&mut config);
+        assert_eq!(config.ec_layout, Some(yamato_core::EcLayout::Compat));
+        assert_eq!(Knob::EcLayout.value(&config), "Compatibility");
+
+        Knob::EcLayout.cycle(&mut config);
+        assert_eq!(config.ec_layout, Some(yamato_core::EcLayout::Standard));
+        assert_eq!(Knob::EcLayout.value(&config), "Standard");
+    }
+
+    #[test]
+    fn the_controller_mode_words_match_the_hint_that_names_them() {
+        // The tooltip tells somebody to try Compatibility mode; this row is
+        // where they go to do it. If the words drift apart the advice points
+        // at a control that does not exist.
+        let config = yamato_core::Config {
+            ec_layout: Some(yamato_core::EcLayout::Compat),
+            ..yamato_core::Config::default()
+        };
+
+        let value = Knob::EcLayout.value(&config);
+        let hint = crate::ipc::layout_hint_words(crate::ipc::LAYOUT_HINT_TRY_COMPAT).unwrap();
+
+        assert!(hint.contains(&value), "the hint says {hint:?} but the row says {value:?}");
+        assert!(Knob::EcLayout.describe().starts_with("Advanced"));
     }
 
     #[test]

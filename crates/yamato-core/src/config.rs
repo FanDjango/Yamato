@@ -120,6 +120,41 @@ pub enum StartupMode {
     Smart,
 }
 
+/// Where this machine keeps its embedded controller, as stored on disk.
+///
+/// Mirrors `yamato_ec::Layout`, and is a separate type for the same reason
+/// [`StoredPoint`] is separate from `CurvePoint`: the on-disk shape has to
+/// stay stable whatever the runtime type does. The settings window calls the
+/// alternate layout "Compatibility mode", and so does everything else a
+/// person reads; `compat` is only its spelling in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EcLayout {
+    /// The ACPI-specified ports, 0x62/0x66, via LpcACPIEC.
+    Standard,
+    /// Compatibility mode: the 0x1600/0x1604 window, via LpcIO, for the
+    /// machines that answer nothing at the standard ports.
+    Compat,
+}
+
+impl From<EcLayout> for yamato_ec::Layout {
+    fn from(l: EcLayout) -> Self {
+        match l {
+            EcLayout::Standard => yamato_ec::Layout::Standard,
+            EcLayout::Compat => yamato_ec::Layout::Alternate,
+        }
+    }
+}
+
+impl From<yamato_ec::Layout> for EcLayout {
+    fn from(l: yamato_ec::Layout) -> Self {
+        match l {
+            yamato_ec::Layout::Standard => EcLayout::Standard,
+            yamato_ec::Layout::Alternate => EcLayout::Compat,
+        }
+    }
+}
+
 impl From<StartupMode> for Mode {
     fn from(m: StartupMode) -> Self {
         match m {
@@ -214,6 +249,25 @@ pub struct Config {
     /// with a hint attached; wrong the other way, an unmanaged fan.
     #[serde(default)]
     pub single_fan: bool,
+
+    /// Where this machine keeps its embedded controller.
+    ///
+    /// `None` means not yet determined, which only a fresh install is: the
+    /// engine probes both layouts exactly once, at the first start that finds
+    /// this unset, and writes the winner here. Every start after that loads
+    /// the recorded layout and probes nothing, because probing is a hardware
+    /// interaction, on the alternate module a walk of the SuperIO
+    /// configuration space, and it has no business happening on every boot of
+    /// a machine that answered the question at its first one.
+    ///
+    /// Also the override. The settings window's Controller mode row writes a
+    /// value straight into this field, and the engine drives whatever is
+    /// here without validating it away: someone overriding a detection is
+    /// owed the override, and a wrong one reports the controller unreachable,
+    /// which is the honest outcome. A default is deliberately not supplied,
+    /// since defaulting to Standard would mean a fresh install never probes.
+    #[serde(default)]
+    pub ec_layout: Option<EcLayout>,
 }
 
 fn default_standby_poll() -> u32 {
@@ -375,6 +429,7 @@ impl Default for Config {
             tray_numbers: default_tray_numbers(),
             tray_sensor: None,
             single_fan: false,
+            ec_layout: None,
         }
     }
 }
@@ -470,7 +525,20 @@ impl Config {
             Err(e) => return Err(ConfigError::Io(e)),
         };
 
-        let mut config: Config = serde_json::from_str(&text).map_err(ConfigError::Parse)?;
+        // A byte order mark is not JSON, and serde refuses a document that
+        // begins with one. Plenty of editors write one into a UTF-8 file
+        // unasked, PowerShell's own Set-Content among them, so anybody who
+        // opens this file to change a number by hand stands a fair chance of
+        // saving one back.
+        //
+        // The cost is out of all proportion to three bytes. The parse fails,
+        // the service loads with unwrap_or_default, and every profile, every
+        // interval and every setting is quietly replaced by the defaults with
+        // nothing anywhere saying why. It cost an afternoon of hardware
+        // testing here before the file was looked at as bytes.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text.as_str());
+
+        let mut config: Config = serde_json::from_str(text).map_err(ConfigError::Parse)?;
         config.migrate()?;
         config.validate()?;
 
@@ -630,6 +698,30 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("yamato-test-{tag}-{}.json", std::process::id()));
         p
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_cost_somebody_every_setting_they_have() {
+        // Editors add one to UTF-8 files unasked. Without this the parse
+        // fails, the service loads with unwrap_or_default, and the machine
+        // runs on stock settings while the file on disk still holds the
+        // real ones and nothing says a word about it.
+        let path = temp_path("bom");
+        let mut cfg = Config::default();
+        cfg.poll_secs = 9;
+        cfg.ec_layout = Some(EcLayout::Compat);
+        cfg.save(&path).unwrap();
+
+        let clean = std::fs::read(&path).unwrap();
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(&clean);
+        std::fs::write(&path, &with_bom).unwrap();
+
+        let read = Config::load(&path).expect("a leading BOM must not fail the load");
+        assert_eq!(read.poll_secs, 9, "settings were replaced by defaults");
+        assert_eq!(read.ec_layout, Some(EcLayout::Compat));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1211,6 +1303,65 @@ mod tests {
         assert!(!Config::load(&path).unwrap().single_fan);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_fresh_install_has_no_layout_on_record() {
+        // None is what makes the engine probe, and it must only ever mean a
+        // machine nobody has probed: a default of Standard here would mean
+        // no install ever probed at all.
+        assert_eq!(Config::default().ec_layout, None);
+
+        // A file written before the field existed is a machine that was
+        // never probed, and must load as one.
+        let path = temp_path("nolayout");
+        let json = r#"{
+            "version": 1, "poll_secs": 5, "watchdog_secs": 30,
+            "startup_mode": "smart", "active_profile": "X",
+            "profiles": [{"name":"X","points":[{"temp":50,"level":1,"hyst_up":0,"hyst_down":4},{"temp":88,"level":128,"hyst_up":0,"hyst_down":5}]}]
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        assert_eq!(Config::load(&path).unwrap().ec_layout, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_recorded_layout_round_trips_and_keeps_its_spelling() {
+        // The engine writes this once and every later boot steers by it, so
+        // losing it on the way to disk would mean probing forever. The
+        // spelling is load bearing too: "compat" is what shipped files will
+        // contain, and a rename would silently un-record every machine that
+        // needed recording most.
+        let path = temp_path("layout");
+
+        for (layout, spelled) in
+            [(EcLayout::Standard, "\"standard\""), (EcLayout::Compat, "\"compat\"")]
+        {
+            let cfg = Config { ec_layout: Some(layout), ..Config::default() };
+            cfg.save(&path).unwrap();
+
+            assert_eq!(Config::load(&path).unwrap().ec_layout, Some(layout));
+            assert!(
+                std::fs::read_to_string(&path).unwrap().contains(spelled),
+                "{layout:?} is not stored as {spelled}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_stored_layout_and_the_driven_layout_agree_both_ways() {
+        // The conversion is the seam between the file and the hardware; a
+        // crossed pair here would drive the wrong ports on exactly the
+        // machines nobody debugging a config file can test.
+        for layout in [EcLayout::Standard, EcLayout::Compat] {
+            assert_eq!(EcLayout::from(yamato_ec::Layout::from(layout)), layout);
+        }
+
+        assert_eq!(yamato_ec::Layout::from(EcLayout::Compat), yamato_ec::Layout::Alternate);
     }
 
     #[test]

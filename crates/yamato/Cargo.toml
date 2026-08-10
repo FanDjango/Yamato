@@ -15,6 +15,9 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    # CreateDirectoryW with an explicit descriptor, for the settings
+    # directory when the service gets there before any user session has.
+    "Win32_Storage_FileSystem",
     "Win32_System_Memory",
     "Win32_System_Threading",
     # Reporting a failed fan handback on the way out of a stop.

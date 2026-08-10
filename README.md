@@ -171,6 +171,7 @@ here it is anyway.
 | **Logging** | Off | On / Off | Writes what was read and what was asked for to `%ProgramData%\Yamato\`, as CSV. Rotated once at the size below so it can't fill a disk. Off unless you ask, because a program resident all day shouldn't write to disk every few seconds. |
 | **Open at start** | Tray only | Window / Tray only | Whether this window opens at launch or Yamato goes straight to the tray. |
 | **Fans** | Dual | Single / Dual | Whether this machine has a second fan. Some single-fan ThinkPads answer the second selector with a value that doesn't track what was written, so every write looks declined and every handback looks failed. Set Single and that selector is never touched. |
+| **Controller mode** | Probed once | Standard / Compatibility | How the embedded controller is reached: the standard `0x62`/`0x66` ports, or the `0x1600` window some ThinkPads use instead. Decided by a probe at the first start, remembered, and never probed again; this row is the override. Advanced, and the wrong mode stops fan control working. |
 
 Click a curve point and two more rows appear for that point alone:
 
@@ -209,26 +210,38 @@ ECs are built on, and Linux's [tp_smapi][tpsmapi] has driven the EC through
 `0x1600`/`0x1604` for twenty years. ThinkWiki documents it under
 [Embedded Controller Firmware][thinkwiki-ec].
 
-Yamato handles both. At every start it probes both layouts and drives the one
-where a controller demonstrably answers, so there is no setting and nothing
-to know about your model. To be plain about what is proven: the standard
-ports are confirmed on hardware, a P1 Gen 7 here plus the T430 and X230T
-covered by TPFanControl's own testing. The `0x1600` window is confirmed
-reachable, measured four independent ways on a P1 Gen 7, but that machine
-keeps its controller at the standard ports, and no machine that actually
-lives at `0x1600` has run Yamato yet. If yours does, the application event
-log records which layout was chosen and why, and a report either way is
-welcome.
+Yamato handles both. The first time the engine starts it probes both
+layouts, demands a controller that demonstrably answers and provably holds a
+fan write, and records the winner in `config.json`. Every start after that
+drives the recorded layout and probes nothing. The **Controller mode** row at
+the bottom of the settings window overrides the record: **Standard** is
+`0x62`/`0x66`, **Compatibility** is the `0x1600` window, and whatever is set
+there is driven as given. If Yamato says it cannot reach the embedded
+controller, try Compatibility mode before concluding your machine is
+unsupported. The tray suggests exactly that when the controller stays out of
+reach, because from every other angle a machine that needs Compatibility
+mode looks identical to one that is not supported at all, and one of them is
+a setting away from working.
 
-Probing the layout a machine doesn't use is safe by construction. Each layout
-runs through its own PawnIO module, and each module bounds what can be
-touched. The standard one permits exactly ports `0x62` and `0x66`. The one
-for the `0x1600` window opens only the port windows the machine itself
-declares, which on the ThinkPad where they were measured came to 68 ports of
-the 65,536 possible, and it can never permit anything below `0x100`, where
-the legacy system hardware lives. Yamato holds itself narrower than either:
-whichever layout wins, it addresses that layout's two ports and refuses its
-own requests for anything else.
+To be plain about what is proven: the standard ports are confirmed on
+hardware, a P1 Gen 7 here plus the T430 and X230T covered by TPFanControl's
+own testing. The `0x1600` window is confirmed reachable, measured four
+independent ways on a P1 Gen 7, but that machine keeps its controller at the
+standard ports, and no machine that actually lives at `0x1600` has run
+Yamato yet. If yours does, the application event log records which mode was
+chosen and why, and a report either way is welcome.
+
+Probing the layout a machine doesn't use is safe by construction, and since
+the probe runs once in the life of an install, it is also rare by
+construction. Each layout runs through its own PawnIO module, and each
+module bounds what can be touched. The standard one permits exactly ports
+`0x62` and `0x66`. The one for the `0x1600` window permits the port windows
+the machine itself declares, plus the SuperIO configuration pair it
+discovers them through and a fixed pair belonging to ASUS embedded
+controllers; on the ThinkPad where this was measured, all of it together
+came to 68 ports of the 65,536 possible. Yamato holds itself narrower than
+either: whichever mode is in use, it addresses that mode's two ports and
+refuses its own requests for anything else.
 
 The hard floor is 1703. That's when `SetProcessDpiAwarenessContext` appeared,
 and it's linked statically, so anything older won't start at all rather than

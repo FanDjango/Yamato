@@ -74,7 +74,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const DRAIN_READS: usize = 8;
 
 /// Ceiling on one whole read pass, regardless of how the individual waits go.
+///
+/// Also the whole envelope for probing one layout, retries included, so the
+/// probe's persistence never buys a later start than one slow pass already
+/// could. See probe_persistently.
 const SAMPLE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Pause between probe attempts on a layout that could not be examined.
+///
+/// The same quarter second the caller's tick loop waits between its retries
+/// of a failed pass. When the failures are quick ones, an IOCTL erroring
+/// outright, SAMPLE_BUDGET holds roughly the ten tries TPFanControl gives
+/// the controller before believing a read failed.
+const PROBE_RETRY_PAUSE: Duration = Duration::from_millis(250);
 
 /// The same for a fan write, which retries across both fans and so has more
 /// room to overrun. Sized so a slow controller still gets its retries without
@@ -105,7 +117,29 @@ pub struct Probe {
     /// The raw bank 0 sensor bytes, when they could be read.
     pub temps: Option<[u8; PROBE_TEMPS]>,
     /// Why this layout was not accepted. `None` means it passed.
-    pub failure: Option<String>,
+    pub failure: Option<ProbeFailure>,
+}
+
+/// Why a layout failed its probe, split by what the failure is evidence of.
+///
+/// The split carries the one distinction the caller must not lose: whether
+/// the verdict may be written into the settings. A rejection describes the
+/// machine and will still be true at the next boot. An unexamined layout
+/// describes one moment of one boot: four back-to-back service restarts on a
+/// measured machine produced three of them against a standard layout that
+/// works, and a decision it could have outranked, recorded anyway, would
+/// freeze an accident of timing into every boot that follows. See
+/// worth_recording for when the distinction bites.
+#[derive(Debug, Clone)]
+pub enum ProbeFailure {
+    /// The layout answered, and what came back is not a ThinkPad EC: the
+    /// values failed plausibility, or the fan register would not hold a
+    /// write it was given a fair chance to take. Evidence about the machine.
+    Rejected(String),
+    /// The layout could not be examined: the controller was locked, an
+    /// IOCTL failed, a handshake timed out, the budget ran out, or the
+    /// module never loaded. Evidence about this moment only.
+    Unexamined(String),
 }
 
 impl Probe {
@@ -113,14 +147,22 @@ impl Probe {
         self.failure.is_none()
     }
 
-    /// A layout that could not be probed at all, module or lock trouble
-    /// rather than a verdict on the hardware.
-    fn unprobed(layout: Layout, why: &Error) -> Probe {
-        Probe { layout, fan_ctrl: None, temps: None, failure: Some(format!("not probed: {why}")) }
+    /// Whether this probe reached a verdict about the machine rather than
+    /// about the moment. A pass and a rejection both did; a layout that
+    /// could not be examined got no verdict at all, and nothing may be
+    /// recorded on the strength of it.
+    pub fn definitive(&self) -> bool {
+        !matches!(self.failure, Some(ProbeFailure::Unexamined(_)))
     }
 
     fn rejected(layout: Layout, why: String) -> Probe {
-        Probe { layout, fan_ctrl: None, temps: None, failure: Some(why) }
+        Probe { layout, fan_ctrl: None, temps: None, failure: Some(ProbeFailure::Rejected(why)) }
+    }
+
+    /// A layout that could not be examined, lock or transport trouble
+    /// rather than a verdict on the hardware.
+    fn unexamined(layout: Layout, why: String) -> Probe {
+        Probe { layout, fan_ctrl: None, temps: None, failure: Some(ProbeFailure::Unexamined(why)) }
     }
 }
 
@@ -128,9 +170,14 @@ impl fmt::Display for Probe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: ", self.layout.describe())?;
 
+        // "Rejected" and "could not be examined" are different claims, and
+        // the event log is where the difference reaches a person: one says
+        // this window is not an EC, the other says nothing about the window
+        // was learned at all.
         match &self.failure {
             None => write!(f, "passed")?,
-            Some(why) => write!(f, "rejected ({why})")?,
+            Some(ProbeFailure::Rejected(why)) => write!(f, "rejected ({why})")?,
+            Some(ProbeFailure::Unexamined(why)) => write!(f, "could not be examined ({why})")?,
         }
 
         if let Some(v) = self.fan_ctrl {
@@ -362,20 +409,41 @@ pub struct Ec {
     /// next restart.
     single_fan: AtomicBool,
     /// What both layouts answered when probed, kept for whoever has to
-    /// explain this machine later.
+    /// explain this machine later. Empty on a configured handle, which
+    /// probes nothing.
     probes: Vec<Probe>,
+    /// Whether the layout was dictated by the settings rather than probed.
+    /// A configured layout is trusted, not vouched for, and the summary has
+    /// to say which.
+    configured: bool,
+    /// Whether the module's own setup has run on this handle. See
+    /// [`Ec::ensure_prepared`].
+    prepared: AtomicBool,
 }
 
 impl Ec {
     /// Opens the controller at whichever port layout this machine actually
     /// has, decided on evidence from both.
     ///
-    /// Both layouts are probed every time, and the probe demands a working
-    /// handshake plus values that read like a ThinkPad: see
-    /// plausible_fan_ctrl and plausible_temps for why answering at all is
-    /// not enough. Choosing on evidence from both, rather than stopping at
-    /// the first that fails to error, is what keeps a machine that decodes
-    /// both windows on the one that has an EC behind it.
+    /// This runs until a verdict sticks: the caller records a definitive
+    /// verdict in the settings, and every start after that goes through
+    /// [`Ec::open_configured`] instead. Probing is a hardware interaction,
+    /// on the alternate module a walk of the SuperIO configuration space
+    /// through 0x4e/0x4f, and repeating it at every boot on machines that
+    /// settled the question at their first one bought nothing.
+    ///
+    /// Both layouts are probed, and the probe demands a working handshake,
+    /// values that read like a ThinkPad, and a fan register that holds a
+    /// write: see plausible_fan_ctrl, plausible_temps and prove_fan_control
+    /// for why answering at all is not enough. Each layout gets the tick
+    /// path's persistence before any failure is believed, because one look
+    /// at a bad moment once rejected a working layout on three restarts out
+    /// of four: see probe_persistently. Choosing on evidence from both,
+    /// rather than stopping at the first that fails to error, is what keeps
+    /// a machine that decodes both windows on the one that has an EC behind
+    /// it. A choice that an unexamined loser could have outranked is driven
+    /// for this session but never recorded, so the next start looks again:
+    /// see worth_recording.
     ///
     /// The probe's job ends at picking the better layout when it can tell.
     /// It is never a reason to refuse to run: when nothing validates, this
@@ -412,11 +480,12 @@ impl Ec {
                     | Error::DriverTooOld { .. }),
                 ) => return Err(e),
                 // The module would not load: missing beside the executable,
-                // or rejected by the driver. Recorded as evidence, and kept
-                // in case it was the fallback layout's module, where it
-                // becomes the error.
+                // or rejected by the driver. That is trouble with this
+                // install, not evidence about the machine's ports, so it
+                // counts as unexamined. Kept in case it was the fallback
+                // layout's module, where it becomes the error.
                 Err(e) => {
-                    probes.push(Probe::unprobed(layout, &e));
+                    probes.push(Probe::unexamined(layout, format!("not probed: {e}")));
                     if aborted.is_none() {
                         aborted = Some(e);
                     }
@@ -445,22 +514,34 @@ impl Ec {
         }
     }
 
-    /// Loads one layout's module and probes it. `Err` means the module could
-    /// not be loaded at all; a probe that ran and failed, or could not run
-    /// because the controller was contended, is an `Ok` carrying the
-    /// evidence, along with the handle in case it ends up the fallback.
+    /// Loads one layout's module and probes it, with retries. `Err` means
+    /// the module could not be loaded at all; a probe that ran and failed,
+    /// or could not run because the controller was contended, is an `Ok`
+    /// carrying the evidence, along with the handle in case it ends up the
+    /// fallback.
     fn try_layout(layout: Layout) -> Result<(Ec, Probe), Error> {
         let ec = Ec::with_io(Io::Pawn(PawnIo::open_module(layout)?));
-
-        let probe = match ec.probe() {
-            Ok(probe) => probe,
-            // The lock was busy, so nothing was learned about the layout and
-            // nothing may be concluded from it: another tool holding the
-            // controller at logon is routine, not a diagnosis.
-            Err(e) => Probe::unprobed(layout, &e),
-        };
+        let probe = ec.probe_persistently();
 
         Ok((ec, probe))
+    }
+
+    /// Opens the controller on the given layout because the settings say so,
+    /// probing nothing and validating nothing away.
+    ///
+    /// This is every start after the first. The layout is driven as given,
+    /// whether it came from the probe that ran once at first start or from
+    /// somebody overriding it, and no SuperIO discovery happens here: on the
+    /// alternate layout the module's own setup runs lazily, under the lock,
+    /// at the first transaction. If the configuration is wrong, the engine
+    /// reports the controller unreachable exactly as it would for any dead
+    /// controller, which is the honest outcome of overriding a detection,
+    /// and the client suggests trying the other mode.
+    pub fn open_configured(layout: Layout) -> Result<Self, Error> {
+        let mut ec = Ec::with_io(Io::Pawn(PawnIo::open_module(layout)?));
+        ec.configured = true;
+
+        Ok(ec)
     }
 
     fn with_io(io: Io) -> Ec {
@@ -470,6 +551,8 @@ impl Ec {
             // Two fans until the configuration says otherwise.
             single_fan: AtomicBool::new(false),
             probes: Vec::new(),
+            configured: false,
+            prepared: AtomicBool::new(false),
         }
     }
 
@@ -483,27 +566,77 @@ impl Ec {
         &self.probes
     }
 
+    /// Whether the layout being driven passed its own probe. Derived from
+    /// the evidence rather than stored, so the two can never disagree.
+    ///
+    /// Always false on a configured handle, which probes nothing: a
+    /// configured layout is trusted, not vouched for, and nothing that never
+    /// ran gets to be called a validation. worth_recording starts from this
+    /// answer, so a fallback nothing vouched for is never frozen in as an
+    /// answer.
+    pub fn validated(&self) -> bool {
+        self.probes.iter().any(|p| p.layout == self.layout() && p.passed())
+    }
+
+    /// Whether the selection is one the caller may write into the settings,
+    /// where it becomes every later boot's answer.
+    ///
+    /// The record has to survive one question: could the layout that was
+    /// not examined have beaten the winner? Ties go to the standard layout,
+    /// so a passing standard layout is recorded whatever became of the
+    /// alternate: even a pass there would have changed nothing, and holding
+    /// the record back would re-probe machines with nothing left to learn
+    /// on every boot, through the SuperIO walk the record exists to avoid.
+    /// The alternate winning is different: it wins only over a standard
+    /// layout that did not pass, so its record may stand on a standard
+    /// rejection but never on a standard layout that merely could not be
+    /// examined. On a machine having a bad moment, that unexamined layout
+    /// may be the right one, and freezing the rival in would strand it
+    /// permanently. That one case is driven for the session and left
+    /// unrecorded, which costs one more probe at the next start.
+    pub fn worth_recording(&self) -> bool {
+        self.validated()
+            && (self.layout() == Layout::Standard
+                || self.probes.iter().all(|p| p.definitive()))
+    }
+
     /// The whole selection on one line, for a log entry. Names the winner and
     /// what both layouts answered, which is the difference between a bug
     /// report that can be acted on and one that starts an interrogation.
     ///
     /// A fallback says so in as many words. This string is what a bug report
-    /// carries, and "driving the standard layout" would read as a verdict on
-    /// hardware that was never actually vouched for.
+    /// carries, and "driving the standard mode" would read as a verdict on
+    /// hardware that was never actually vouched for. A configured layout says
+    /// so too, for the same reason: nothing probed anything this boot.
     pub fn selection_summary(&self) -> String {
-        // Derived from the evidence rather than stored, so the two can
-        // never disagree: the choice was validated only if the chosen
-        // layout's own probe passed.
-        let validated =
-            self.probes.iter().any(|p| p.layout == self.layout() && p.passed());
+        if self.configured {
+            return format!(
+                "driving the {} because the settings say so, without probing",
+                self.layout().describe()
+            );
+        }
 
-        let mut summary = if validated {
-            format!("driving the {}", self.layout().describe())
-        } else {
+        let mut summary = if !self.validated() {
             format!(
                 "no layout validated at startup; falling back to the {} and \
                  leaving the engine to retry",
                 self.layout().describe()
+            )
+        } else if self.worth_recording() {
+            format!("driving the {}", self.layout().describe())
+        } else {
+            // Only one case lands here: the alternate layout won while the
+            // standard one could not be examined, and the standard layout
+            // would have taken precedence had it passed. Driven, and
+            // deliberately not written down so the next start stays free to
+            // look again. Said in as many words, because this line is what
+            // a bug report from that next start will carry.
+            format!(
+                "driving the {} for this session without recording it, \
+                 because the {} could not be examined and would have taken \
+                 precedence had it passed; the next start probes again",
+                self.layout().describe(),
+                Layout::Standard.describe()
             )
         };
 
@@ -515,8 +648,47 @@ impl Ec {
         summary
     }
 
+    /// Probes this layout with the persistence the running engine has, and
+    /// returns the last word: the first definitive answer, or the final
+    /// transient failure once the budget is spent.
+    ///
+    /// One look was not a fair chance. Back-to-back service restarts on a
+    /// measured machine rejected a working standard layout three starts out
+    /// of four, on transient failures from the previous instance still
+    /// letting go of the controller. The tick path retries a failed pass
+    /// for exactly this reason, and TPFanControl gives the controller ten
+    /// tries before believing a read failed. Only transient failures are
+    /// retried here: a rejection is evidence about the machine, and asking
+    /// again would only wear the same answer out of it.
+    ///
+    /// The attempts share one SAMPLE_BUDGET rather than getting one each,
+    /// and the envelope opens before the lock is first tried, so the
+    /// persistence never buys a meaningfully later start than one slow
+    /// probe already could.
+    fn probe_persistently(&self) -> Probe {
+        let until = Instant::now() + SAMPLE_BUDGET;
+
+        loop {
+            let probe = match self.probe(until) {
+                Ok(probe) => probe,
+                // The lock was busy: something is alive and holding the
+                // controller, which at logon is routine, not a diagnosis.
+                // Worth waiting out, never worth concluding from.
+                Err(why) => Probe::unexamined(self.io.layout(), why.to_string()),
+            };
+
+            if probe.definitive() || Instant::now() + PROBE_RETRY_PAUSE >= until {
+                return probe;
+            }
+
+            std::thread::sleep(PROBE_RETRY_PAUSE);
+        }
+    }
+
     /// One locked look at whether a ThinkPad EC answers at this layout's
-    /// ports, and the evidence either way.
+    /// ports, and the evidence either way. `until` bounds the pass; it is
+    /// shared with the caller's retries so the whole examination of a
+    /// layout stays inside one budget.
     ///
     /// `Err` is only for a probe that could not run, which today means the
     /// lock: contention says something is alive and holding the controller,
@@ -526,26 +698,31 @@ impl Ec {
     /// The handshake itself is the first check and not a formality. It
     /// cannot complete against a floating port: OBF has to rise in answer to
     /// the read command, which takes an EC, and a port stuck at 0x00 or 0xff
-    /// times out in settle or drains forever in begin_transaction. The value
-    /// checks on top are for windows that are decoded but empty, which
-    /// return constants that a status-bit wait can sail straight through.
-    fn probe(&self) -> Result<Probe, Error> {
+    /// times out in settle or drains forever in begin_transaction. A timeout
+    /// there keeps the layout from passing, but it is never a rejection: the
+    /// same silence comes from a real EC with another tool mid-transaction
+    /// on it, so all it proves is that nothing was learned. The value checks
+    /// on top are for windows that are decoded but empty, which return
+    /// constants that a status-bit wait can sail straight through.
+    fn probe(&self, until: Instant) -> Result<Probe, Error> {
         let _guard = self.lock.lock()?;
         let layout = self.io.layout();
 
         // LpcIO refuses every port until a slot is selected and its BARs
         // found; doing it under the same guard makes the whole probe one
-        // bracketed transaction. Failure here is a verdict on the layout,
-        // a machine with no SuperIO in slot 1 for instance, not on the probe.
-        if let Err(e) = self.io.prepare() {
+        // bracketed transaction. Failure here is a rejection, not a
+        // transient: it is the module's own discovery reporting what it
+        // found, a machine with no SuperIO in slot 1 for instance. Calling
+        // it definitive can never record a wrong layout, because only a
+        // layout that passed its own probe is ever recorded, and the
+        // standard layout has nothing to prepare and so nothing to fail.
+        if let Err(e) = self.ensure_prepared() {
             return Ok(Probe::rejected(layout, format!("could not be set up: {e}")));
         }
 
-        let until = Instant::now() + SAMPLE_BUDGET;
-
         let fan_ctrl = match self.read_register(REG_FAN_CTRL) {
             Ok(v) => v,
-            Err(e) => return Ok(Probe::rejected(layout, format!("no handshake: {e}"))),
+            Err(e) => return Ok(Probe::unexamined(layout, format!("no handshake: {e}"))),
         };
 
         let mut temps = [0u8; PROBE_TEMPS];
@@ -555,7 +732,9 @@ impl Ec {
                     layout,
                     fan_ctrl: Some(fan_ctrl),
                     temps: None,
-                    failure: Some("probe ran out of budget".to_string()),
+                    failure: Some(ProbeFailure::Unexamined(
+                        "probe ran out of budget".to_string(),
+                    )),
                 });
             }
 
@@ -566,21 +745,128 @@ impl Ec {
                         layout,
                         fan_ctrl: Some(fan_ctrl),
                         temps: None,
-                        failure: Some(format!("sensors unreadable: {e}")),
+                        failure: Some(ProbeFailure::Unexamined(format!(
+                            "sensors unreadable: {e}"
+                        ))),
                     });
                 }
             }
         }
 
-        let failure = if !plausible_fan_ctrl(fan_ctrl) {
-            Some(format!("fan register {fan_ctrl:#04x} is not a fan state"))
+        let mut failure = if !plausible_fan_ctrl(fan_ctrl) {
+            Some(ProbeFailure::Rejected(format!(
+                "fan register {fan_ctrl:#04x} is not a fan state"
+            )))
         } else if !plausible_temps(&temps) {
-            Some("bank 0 does not read like temperature sensors".to_string())
+            Some(ProbeFailure::Rejected(
+                "bank 0 does not read like temperature sensors".to_string(),
+            ))
         } else {
             None
         };
 
+        // Reading proves the transport. It does not prove the fan register is
+        // writable, and a layout that can be read but not driven is worse
+        // than useless: chosen, it would leave the engine believing it has
+        // control it does not have. So the last check is a write that has to
+        // hold. Tried only once everything above has passed, so no byte is
+        // ever written through a window that has not already read like a
+        // ThinkPad.
+        if failure.is_none() {
+            failure = if Instant::now() >= until {
+                Some(ProbeFailure::Unexamined("probe ran out of budget".to_string()))
+            } else {
+                self.prove_fan_control(until)
+            };
+        }
+
         Ok(Probe { layout, fan_ctrl: Some(fan_ctrl), temps: Some(temps), failure })
+    }
+
+    /// Writes the firmware handoff to the fan register and requires it to
+    /// hold. `None` means it did; `Some` carries why it did not, and whether
+    /// that is a verdict on the machine or only on the moment.
+    ///
+    /// The test value is 0x80 and nothing else. It is the safe resting
+    /// state, it is where the engine wants the machine at startup anyway,
+    /// and unlike any manual level it cannot leave a fan pinned if the probe
+    /// is interrupted between the write and the read. The original value is
+    /// deliberately not restored afterwards: writing a manual level back
+    /// would recreate exactly the hazard the choice of 0x80 avoids.
+    ///
+    /// A write that lands but does not hold is retried with a settling
+    /// pause, the same discipline set_fan applies before it calls a write
+    /// declined, because the controller can take a moment to accept a
+    /// change. Only after that fair chance is the refusal a rejection. A
+    /// write or read that fails outright is the transport failing, which
+    /// says nothing about the machine, so it comes back transient for the
+    /// caller to retry.
+    ///
+    /// Every way out leaves the controller in a state something is managing.
+    /// A write that fails mid-handshake never lands, so the register keeps
+    /// whatever it held; a write that lands puts the firmware in charge; and
+    /// a write that lands but does not hold means whatever held the register
+    /// before still does.
+    fn prove_fan_control(&self, until: Instant) -> Option<ProbeFailure> {
+        let mut read_back = 0u8;
+
+        for attempt in 0..5 {
+            // Settling time between attempts, matching set_fan: the
+            // controller can take a moment to accept a change, particularly
+            // when coming out of firmware control.
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            if let Err(e) = self.write_register(REG_FAN_CTRL, FAN_BIOS) {
+                return Some(ProbeFailure::Unexamined(format!(
+                    "fan register not writable: {e}"
+                )));
+            }
+
+            match self.read_register(REG_FAN_CTRL) {
+                // Judged like every other look at this register: the firmware
+                // flag on and the disengage bit off, reserved bits ignored.
+                Ok(v) if v & FAN_BIOS != 0 && v & FAN_DISENGAGED == 0 => return None,
+                Ok(v) => read_back = v,
+                Err(e) => {
+                    return Some(ProbeFailure::Unexamined(format!(
+                        "fan register unreadable after the handoff: {e}"
+                    )));
+                }
+            }
+
+            if Instant::now() >= until {
+                break;
+            }
+        }
+
+        Some(ProbeFailure::Rejected(format!(
+            "fan register did not hold a write: wrote {FAN_BIOS:#04x}, read back {read_back:#04x}"
+        )))
+    }
+
+    /// Runs the module's own setup once, before the first transaction.
+    ///
+    /// LpcIO refuses every port until a slot is selected and its BARs found;
+    /// on the standard layout there is nothing to do and the first call is a
+    /// cheap no-op never repeated. Lazy rather than done at open, because the
+    /// configured path opens without probing and the EC lock can be busy at
+    /// boot: a handle that could only prepare at open would stay dead until
+    /// the next service restart, while this one heals on the first pass that
+    /// gets the lock.
+    ///
+    /// The caller must hold the EC lock, which on the alternate layout
+    /// includes the ISA mutex the module documents for these calls.
+    fn ensure_prepared(&self) -> Result<(), Error> {
+        if self.prepared.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        self.io.prepare()?;
+        self.prepared.store(true, Ordering::SeqCst);
+
+        Ok(())
     }
 
     fn status_port(&self) -> u16 {
@@ -610,6 +896,7 @@ impl Ec {
     /// consistent and not smeared across other tools' accesses.
     pub fn sample(&self) -> Result<EcState, Error> {
         let _guard = self.lock.lock()?;
+        self.ensure_prepared()?;
         // A whole-pass deadline on top of the per-wait one, started before the
         // first transaction. The seven fan and selector reads below were once
         // outside it, which left the pass unbounded.
@@ -692,6 +979,7 @@ impl Ec {
     /// It retries, because the EC does sometimes need a moment.
     pub fn set_fan(&self, value: u8) -> Result<u8, Error> {
         let _guard = self.lock.lock()?;
+        self.ensure_prepared()?;
         let _selector = SelectorGuard { ec: self };
 
         // The same whole-call deadline sample() has. Five attempts across two
@@ -782,6 +1070,11 @@ impl Ec {
     /// Verifying through fan 1 alone would let fan 2 decline silently, leaving
     /// it spinning at a fixed level with nothing managing it.
     fn write_bios_verified(&self) -> Result<(), Error> {
+        // Best effort, unlike everywhere else: this is the handback, and a
+        // handle that never got to prepare should still try the writes and
+        // report their failure honestly rather than refuse to attempt them.
+        let _ = self.ensure_prepared();
+
         let mut failed = None;
 
         // Written to both selectors whatever the fan count, since writing
@@ -963,6 +1256,16 @@ mod tests {
         phase: Phase,
         /// The byte waiting in the output buffer, if any.
         obf: Option<u8>,
+        /// Port reads that fail at the IOCTL before the controller starts
+        /// answering, counting down. What the first moments after a service
+        /// restart look like while the previous instance is still letting
+        /// go of the controller.
+        failing_reads: usize,
+        /// Fan register writes the controller drops before it starts
+        /// holding them, counting down. Real controllers do take a moment
+        /// sometimes, which is why set_fan retries, and the probe's write
+        /// test owes the same patience.
+        dropped_ctrl_writes: usize,
         selector: usize,
         fan_ctrl: [u8; 2],
         /// Fans that take every byte of a write and then do not hold the
@@ -986,6 +1289,8 @@ mod tests {
                     dead: false,
                     phase: Phase::Idle,
                     obf: None,
+                    failing_reads: 0,
+                    dropped_ctrl_writes: 0,
                     selector: 0,
                     fan_ctrl: [FAN_BIOS; 2],
                     declines: [false; 2],
@@ -1015,6 +1320,18 @@ mod tests {
             self.state.lock().unwrap().fan_ctrl = levels;
         }
 
+        /// The next `count` port reads fail at the IOCTL, then the
+        /// controller answers normally.
+        fn fail_next_reads(&self, count: usize) {
+            self.state.lock().unwrap().failing_reads = count;
+        }
+
+        /// The next `count` fan register writes are taken and dropped, then
+        /// writes hold normally.
+        fn drop_ctrl_writes(&self, count: usize) {
+            self.state.lock().unwrap().dropped_ctrl_writes = count;
+        }
+
         fn decline_fan(&self, fan: usize) {
             self.state.lock().unwrap().declines[fan] = true;
         }
@@ -1042,6 +1359,13 @@ mod tests {
             );
 
             let mut state = self.state.lock().unwrap();
+
+            // A staged transport failure comes first: the IOCTL itself
+            // errors, before any question of what the controller would say.
+            if state.failing_reads > 0 {
+                state.failing_reads -= 1;
+                return Err(Error::Call { function: "read_result", code: 0 });
+            }
 
             if self.layout == Layout::Alternate && !state.prepared {
                 return Err(Error::Call { function: "device_not_ready", code: 0 });
@@ -1122,6 +1446,9 @@ mod tests {
 
         match address {
             REG_FAN_SELECT => state.selector = (value as usize).min(1),
+            // A transient drop: the bytes were all taken, the value did not
+            // stick, and the next attempt will do better.
+            REG_FAN_CTRL if state.dropped_ctrl_writes > 0 => state.dropped_ctrl_writes -= 1,
             REG_FAN_CTRL if !state.declines[state.selector] => {
                 state.fan_ctrl[state.selector] = value;
             }
@@ -1135,6 +1462,8 @@ mod tests {
             io: Io::Fake(fake),
             single_fan: AtomicBool::new(false),
             probes: Vec::new(),
+            configured: false,
+            prepared: AtomicBool::new(false),
         }
     }
 
@@ -1143,6 +1472,13 @@ mod tests {
             Io::Fake(fake) => fake,
             Io::Pawn(_) => unreachable!("test controllers are always fakes"),
         }
+    }
+
+    /// One probe attempt with a fresh budget, which is what most tests
+    /// want: the retry loop is exercised where retrying is the point, and
+    /// nowhere else, so a failure a test stages is seen on the first look.
+    fn probe_once(ec: &Ec) -> Result<Probe, Error> {
+        ec.probe(Instant::now() + SAMPLE_BUDGET)
     }
 
     #[test]
@@ -1223,7 +1559,7 @@ mod tests {
     fn a_probe_accepts_a_thinkpad_on_either_layout() {
         for layout in [Layout::Standard, Layout::Alternate] {
             let ec = ec_with(FakeEc::thinkpad(layout));
-            let probe = ec.probe().expect("nothing contends in a test");
+            let probe = probe_once(&ec).expect("nothing contends in a test");
 
             assert!(probe.passed(), "{probe}");
             assert_eq!(probe.fan_ctrl, Some(FAN_BIOS));
@@ -1231,31 +1567,248 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_rejects_a_decoded_but_empty_window() {
+    fn a_probe_outlasts_the_transient_failures_a_restart_leaves_behind() {
+        // The measured defect: four back-to-back service restarts, and three
+        // of them rejected the standard layout on IOCTL failures from the
+        // previous instance still letting go of the controller. One look is
+        // not a fair chance. The tick path already retries a failed pass;
+        // the probe extends the same patience before it believes anything.
+        let flaky = FakeEc::thinkpad(Layout::Standard);
+        flaky.fail_next_reads(1);
+
+        let ec = ec_with(flaky);
+        let single = probe_once(&ec).expect("nothing contends in a test");
+        assert!(!single.passed(), "the staged failure must reach a single attempt");
+        assert!(!single.definitive(), "an IOCTL failure is not evidence about the machine");
+
+        let flaky = FakeEc::thinkpad(Layout::Standard);
+        flaky.fail_next_reads(2);
+
+        let ec = ec_with(flaky);
+        let probe = ec.probe_persistently();
+        assert!(probe.passed(), "retries must turn a transient failure into a pass: {probe}");
+    }
+
+    #[test]
+    fn a_controller_slow_to_take_the_handoff_is_not_called_unwritable() {
+        // set_fan retries a write that did not hold, because the controller
+        // can take a moment to accept a change. The probe's write test
+        // judges the machine on the same action and owes it the same
+        // patience: a fan register that holds the value on a later attempt
+        // is a working EC, not a refusal to record against.
+        let controller = FakeEc::thinkpad(Layout::Standard);
+        controller.hold_levels([0x03, 0x03]);
+        controller.drop_ctrl_writes(2);
+
+        let ec = ec_with(controller);
+        let probe = probe_once(&ec).expect("nothing contends in a test");
+
+        assert!(probe.passed(), "{probe}");
+        assert_eq!(fake(&ec).fan_ctrl()[0], FAN_BIOS, "the handoff must have landed");
+    }
+
+    /// A probe that passed, for staging selection evidence by hand.
+    fn passing(layout: Layout) -> Probe {
+        Probe { layout, fan_ctrl: Some(FAN_BIOS), temps: None, failure: None }
+    }
+
+    // The recording table, one test per row. The question the record has to
+    // survive is whether the layout that was not examined could have beaten
+    // the winner, and the four rows are the four answers.
+
+    #[test]
+    fn a_standard_win_is_recorded_whatever_became_of_the_alternate() {
+        // Row one, the common machine. Ties go to the standard layout, so
+        // nothing the alternate could have said would have changed this
+        // outcome: even a pass would have lost. Holding the record back
+        // here would re-probe the most ordinary machines on every boot,
+        // through the SuperIO walk the record exists to avoid.
+        let mut ec = ec_with(FakeEc::thinkpad(Layout::Standard));
+        ec.probes = vec![
+            passing(Layout::Standard),
+            Probe::unexamined(Layout::Alternate, "no handshake: test".to_string()),
+        ];
+
+        assert!(ec.worth_recording(), "an unexamined alternate cannot outrank a standard pass");
+
+        let summary = ec.selection_summary();
+        assert!(summary.starts_with("driving the"), "{summary}");
+        assert!(!summary.contains("without recording"), "{summary}");
+
+        // A definitive alternate changes nothing about the verdict, whether
+        // it was rejected or even passed and lost the tie.
+        ec.probes = vec![passing(Layout::Standard), passing(Layout::Alternate)];
+        assert!(ec.worth_recording(), "a tie the standard layout won is a full verdict");
+    }
+
+    #[test]
+    fn a_compat_win_over_a_rejected_standard_is_recorded() {
+        // Row two, the P53 class. The standard layout answered and is not
+        // this machine's controller; that is evidence about the machine,
+        // and the record may stand on it so no later boot asks again.
+        let mut ec = ec_with(FakeEc::thinkpad(Layout::Alternate));
+        ec.probes = vec![
+            Probe::rejected(Layout::Standard, "fan register 0xff is not a fan state".to_string()),
+            passing(Layout::Alternate),
+        ];
+
+        assert!(ec.worth_recording(), "a standard rejection is evidence to record on");
+        assert!(!ec.selection_summary().contains("without recording"));
+    }
+
+    #[test]
+    fn a_compat_win_over_an_unexamined_standard_is_driven_but_not_recorded() {
+        // Row three, the only unrecorded win, and the case the whole rule
+        // guards: the standard layout would have taken precedence had it
+        // passed, and nobody got to ask it. Recording compatibility mode
+        // here is exactly how one unlucky boot used to strand a standard
+        // machine permanently. The winner still drives this session; the
+        // record stays unset so the next start looks again.
+        let mut ec = ec_with(FakeEc::thinkpad(Layout::Alternate));
+        ec.probes = vec![
+            Probe::unexamined(Layout::Standard, "lock busy".to_string()),
+            passing(Layout::Alternate),
+        ];
+
+        assert!(ec.validated(), "the winner still drives this session");
+        assert!(!ec.worth_recording(), "the loser might have won; nothing may be recorded");
+
+        // And the summary says which happened, in as many words, because
+        // this line is what the next bug report carries.
+        let summary = ec.selection_summary();
+        assert!(summary.contains("without recording"), "{summary}");
+        assert!(summary.contains("could not be examined"), "{summary}");
+        assert!(!summary.contains("falling back"), "{summary}");
+    }
+
+    #[test]
+    fn a_boot_where_nothing_passed_records_nothing() {
+        // Row four, unchanged from before the rule: the fallback is nothing
+        // vouched for, whatever mix of rejection and silence produced it.
+        let mut ec = ec_with(FakeEc::thinkpad(Layout::Standard));
+        ec.probes = vec![
+            Probe::unexamined(Layout::Standard, "lock busy".to_string()),
+            Probe::rejected(
+                Layout::Alternate,
+                "bank 0 does not read like temperature sensors".to_string(),
+            ),
+        ];
+
+        assert!(!ec.validated());
+        assert!(!ec.worth_recording(), "a fallback nothing vouched for is never recorded");
+        assert!(ec.selection_summary().contains("falling back"));
+    }
+
+    #[test]
+    fn a_probe_rejects_a_controller_it_can_read_but_not_drive() {
+        // The gap the write test closes: a window can complete handshakes
+        // and serve plausible values while quietly dropping writes, and a
+        // layout picked on reads alone would leave the engine believing it
+        // has control it does not have. Held at a manual level first, so a
+        // dropped 0x80 is distinguishable from a register that already read
+        // as firmware controlled.
+        for layout in [Layout::Standard, Layout::Alternate] {
+            let controller = FakeEc::thinkpad(layout);
+            controller.hold_levels([0x03, 0x03]);
+            controller.decline_fan(0);
+
+            let ec = ec_with(controller);
+            let probe = probe_once(&ec).expect("nothing contends in a test");
+
+            assert!(!probe.passed(), "a read-only fan register was accepted: {probe}");
+            // A refusal that outlasted the write test's own retries is a
+            // verdict on the machine, the kind a layout record may rest on.
+            assert!(probe.definitive(), "a persistent refusal must be a rejection: {probe}");
+        }
+    }
+
+    #[test]
+    fn a_passing_probe_leaves_the_firmware_in_charge() {
+        // The write test's value is the firmware handoff, chosen because it
+        // is the state that is safe to leave behind: interrupted after the
+        // write, rejected after the read, or passed outright, the register
+        // must never end at a manual level the probe set. The original level
+        // still travels in the evidence.
+        let controller = FakeEc::thinkpad(Layout::Standard);
+        controller.hold_levels([0x07, 0x07]);
+
+        let ec = ec_with(controller);
+        let probe = probe_once(&ec).expect("nothing contends in a test");
+
+        assert!(probe.passed(), "{probe}");
+        assert_eq!(probe.fan_ctrl, Some(0x07), "the evidence must keep the original value");
+        assert_eq!(fake(&ec).fan_ctrl()[0], FAN_BIOS, "the probe must not leave a level set");
+    }
+
+    #[test]
+    fn a_probe_writes_nothing_through_a_window_that_failed_the_read_checks() {
+        // The write test runs last on purpose: a window that already failed
+        // plausibility gets no byte written into it, so probing the layout a
+        // machine does not use stays read only there.
+        let controller = FakeEc::thinkpad(Layout::Alternate);
+        controller.state.lock().unwrap().temps = [0x30; PROBE_TEMPS];
+
+        let ec = ec_with(controller);
+        let probe = probe_once(&ec).expect("nothing contends in a test");
+
+        assert!(!probe.passed(), "constant sensors must still be rejected");
+        assert!(
+            fake(&ec).writes().is_empty(),
+            "a rejected window took a write: {:?}",
+            fake(&ec).writes()
+        );
+    }
+
+    #[test]
+    fn a_configured_handle_claims_no_verdict_it_never_reached() {
+        // The configured path probes nothing, so its summary must say the
+        // layout came from the settings rather than reading like a verdict
+        // on hardware, and validated() must not vouch for it: that answer
+        // decides whether a probe result is written into the settings, and a
+        // configured boot has none to write.
+        let mut ec = ec_with(FakeEc::thinkpad(Layout::Alternate));
+        ec.configured = true;
+
+        assert!(!ec.validated());
+
+        let summary = ec.selection_summary();
+        assert!(summary.contains("settings"), "{summary}");
+        assert!(summary.contains("without probing"), "{summary}");
+        assert!(!summary.contains("falling back"), "{summary}");
+    }
+
+    #[test]
+    fn a_decoded_but_empty_window_never_passes_and_is_never_evidence() {
         // The measured machine: an EC at the standard ports, and an alternate
         // window that also decodes, reading 0x00 at the status port. "IBF
         // clear, OBF clear, ready" is exactly what a naive check sees there.
         // The handshake cannot complete against it, because OBF never rises
-        // in answer to the read command, and the probe must say no.
+        // in answer to the read command, so the window can never pass. It is
+        // also never a rejection: the same silence comes from a real EC with
+        // another tool mid-transaction on it, so the honest verdict is that
+        // the window could not be examined, and the layout record stays
+        // unset for the next start to try again.
         let ec = ec_with(FakeEc::dead_window(Layout::Alternate));
-        let probe = ec.probe().expect("nothing contends in a test");
+        let probe = probe_once(&ec).expect("nothing contends in a test");
 
         assert!(!probe.passed());
+        assert!(!probe.definitive(), "a timeout must not read as a verdict on the machine");
         assert!(probe.fan_ctrl.is_none(), "no handshake means no value to trust");
     }
 
     #[test]
-    fn the_alternate_path_refuses_traffic_until_prepared() {
+    fn the_alternate_path_prepares_itself_before_any_traffic() {
         // LpcIO answers STATUS_DEVICE_NOT_READY to any port access before
-        // slot select and BAR discovery, in that order. The probe is what
-        // performs both, so a handle that has not been probed must fail
-        // loudly rather than read anything.
+        // slot select and BAR discovery, in that order. The configured path
+        // opens without probing, so nothing has prepared the handle by the
+        // time the first pass runs; the pass has to do it itself, under the
+        // lock, or a remembered alternate layout would be dead on every
+        // boot.
         let ec = ec_with(FakeEc::unprepared(Layout::Alternate));
-        assert!(ec.sample().is_err());
+        assert!(ec.sample().is_ok(), "the first pass must prepare the module");
 
-        let probe = ec.probe().expect("nothing contends in a test");
+        let probe = probe_once(&ec).expect("nothing contends in a test");
         assert!(probe.passed(), "{probe}");
-        assert!(ec.sample().is_ok(), "a probed handle is a prepared handle");
     }
 
     #[test]
@@ -1316,6 +1869,18 @@ mod tests {
         );
         // Neither passes: no controller, and no guessing.
         assert_eq!(chosen_layout(&[fail(Layout::Standard), fail(Layout::Alternate)]), None);
+
+        // A layout that could not be examined is not evidence either way:
+        // it neither wins nor blocks the layout that answered.
+        let missing = |layout| Probe::unexamined(layout, "lock busy".to_string());
+        assert_eq!(
+            chosen_layout(&[missing(Layout::Standard), pass(Layout::Alternate)]),
+            Some(Layout::Alternate)
+        );
+        assert_eq!(
+            chosen_layout(&[missing(Layout::Standard), missing(Layout::Alternate)]),
+            None
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub mod import;
 
 pub use config::{
     display_temp, is_built_in, unit_suffix, watchdog_floor,
-    Config, ConfigError, Profile, StartupMode, StoredPoint,
+    Config, ConfigError, EcLayout, Profile, StartupMode, StoredPoint,
     BUILT_IN_PROFILES, HYST_DOWN_MAX, HYST_UP_MAX, LOG_MAX_MB_MAX, LOG_MAX_MB_MIN, MANUAL_ESCAPE_MAX,
     MANUAL_ESCAPE_MIN, POLL_SECS_MAX, POLL_SECS_MIN, SCHEMA_VERSION, STANDBY_POLL_SECS_MAX,
     STANDBY_POLL_SECS_MIN,

@@ -4,7 +4,11 @@
 // Copyright (c) 2026 David Brustein
 //
 // Checks the hardware path end to end: PawnIO opens, the module loads, the EC
-// answers with numbers that look like a ThinkPad. Read only unless asked.
+// answers with numbers that look like a ThinkPad. The probe inside open()
+// also proves each candidate layout can be driven, by writing the firmware
+// handoff to the fan register and reading it back, so running this hands the
+// fan to the firmware on any layout that passes; everything after that is
+// read only unless asked.
 //
 //   cargo run -p yamato-ec --example probe            read and print
 //   cargo run -p yamato-ec --example probe -- bios    hand the fan to firmware

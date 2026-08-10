@@ -21,6 +21,7 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows_sys::Win32::System::WindowsProgramming::{
     QueryInterruptTime, QueryUnbiasedInterruptTime,
@@ -313,12 +314,17 @@ pub struct Host {
     /// nothing shared with another thread, so writing a line cannot be waiting
     /// on anything while the controller is in the middle of a transaction.
     logger: crate::log::Logger,
-    /// Which EC port layout the probe chose at open and what both layouts
-    /// answered, one line. Never a setting, only a record: exposing the
-    /// choice as configuration would let it be wrong, and the machines that
-    /// need the alternate path are the ones nobody debugging a config file
-    /// can test.
+    /// Which EC port layout is being driven and why, one line. On the first
+    /// boot of an install that is the probe's verdict and evidence; on every
+    /// boot after it, the layout the settings named, driven without probing.
     ec_report: String,
+    /// The controller mode worth suggesting when the controller stays out of
+    /// reach, as one of the `ipc::LAYOUT_HINT_` values. Fixed at start:
+    /// the other mode, when this boot drove the mode the settings named, and
+    /// nothing when the probe ran, since a probe has already tried the other
+    /// layout and found it wanting. Published only while the failure run is
+    /// long enough to mean something; see tick.
+    layout_hint: u8,
     /// The flag the caller's loop watches, shared rather than copied.
     ///
     /// A tick that is already under way needs to know a stop is coming, so it
@@ -348,6 +354,147 @@ fn status_for(fault: bool, surrendered: bool, handback_failed: bool) -> u8 {
         ipc::STATUS_SURRENDERED
     } else {
         ipc::STATUS_OK
+    }
+}
+
+/// Opens the controller the way the settings say to.
+///
+/// A recorded or overridden layout is driven as given, probing nothing: this
+/// is the common path, every boot after an install's first, and it touches no
+/// SuperIO. The probe runs only when the file has no answer yet, and a
+/// verdict comes back for start() to write down only when no unexamined
+/// layout could have beaten it: the standard layout wins ties, so a standard
+/// pass is always recorded, while compatibility mode is recorded only over a
+/// standard layout that was definitively rejected. A fallback nothing
+/// vouched for, or compatibility mode chosen while the standard layout
+/// merely could not be examined, is deliberately not returned for recording:
+/// freezing either into the file would strand a machine whose first boot
+/// happened to catch the controller busy or mid-release, while leaving the
+/// field unset costs that machine one more probe.
+fn open_controller(
+    config: &Config,
+) -> Result<(Ec, Option<yamato_core::EcLayout>), yamato_ec::Error> {
+    match config.ec_layout {
+        Some(stored) => Ok((Ec::open_configured(stored.into())?, None)),
+        None => {
+            let ec = Ec::open()?;
+            let decided = ec.worth_recording().then(|| ec.layout().into());
+
+            Ok((ec, decided))
+        }
+    }
+}
+
+/// The controller mode worth suggesting: the one not being driven.
+fn other_mode_hint(layout: yamato_ec::Layout) -> u8 {
+    match layout {
+        yamato_ec::Layout::Standard => ipc::LAYOUT_HINT_TRY_COMPAT,
+        yamato_ec::Layout::Alternate => ipc::LAYOUT_HINT_TRY_STANDARD,
+    }
+}
+
+/// Whether this pass publishes the mode suggestion, and which.
+///
+/// Only while the run of failures is long enough to mean something.
+/// MAX_FAULTS consecutive failed passes is the same evidence the engine hands
+/// the fan back on, so a single busy pass never sends anyone to change a mode
+/// that works, and the moment a pass gets through, the count resets and the
+/// suggestion goes away with it. Free-standing so the persistence rule can be
+/// tested without a controller to fail.
+fn layout_hint_to_publish(hint: u8, fault: bool, consecutive_faults: u32) -> u8 {
+    if fault && consecutive_faults >= MAX_FAULTS {
+        hint
+    } else {
+        ipc::LAYOUT_HINT_NONE
+    }
+}
+
+/// Writes a probed layout into the settings file, so the next start loads it
+/// instead of probing again.
+///
+/// Read fresh from disk rather than saving the copy start() was handed: the
+/// tray and the window write this same file, and saving an older in-memory
+/// copy over it would silently take back whatever they changed since the
+/// service loaded it. For the same reason a file somebody already decided is
+/// left alone: an override written while the probe was still running outranks
+/// the probe.
+fn remember_layout(path: &std::path::Path, layout: yamato_core::EcLayout) {
+    // A file that will not parse is not ours to replace with defaults for the
+    // sake of a one-field note. The next boot probes again, which costs that
+    // broken machine nothing it was not already paying.
+    let Ok(mut on_disk) = Config::load(path) else { return };
+
+    if on_disk.ec_layout.is_some() {
+        return;
+    }
+
+    on_disk.ec_layout = Some(layout);
+
+    // On the very first boot of a fresh install nothing has created the
+    // settings directory yet, and its creator decides who may write in it.
+    if let Some(dir) = path.parent() {
+        if !dir.exists() {
+            create_config_dir_writable_by_users(dir);
+        }
+    }
+
+    let _ = on_disk.save(path);
+}
+
+/// Creates the settings directory with ordinary users allowed to write in it.
+///
+/// This code runs as SYSTEM, and a directory SYSTEM creates under ProgramData
+/// with the default descriptor is read-only to everyone else: the files
+/// inside inherit that, so the settings window, which runs unelevated and
+/// whose whole job is writing this file, could never save again. On any
+/// install where a user session wrote a setting first, the creator-owner rule
+/// already grants the session full control of the directory it made; the
+/// explicit descriptor gives the same answer when the service gets there
+/// first, which the layout record makes possible on a fresh install's first
+/// boot.
+///
+/// Modify rather than full control: users can create, rewrite and replace the
+/// files, and cannot rewrite the permissions themselves.
+fn create_config_dir_writable_by_users(dir: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    // SYSTEM and administrators keep full control; authenticated users get
+    // modify (0x1301bf), inherited by everything created inside. SDDL,
+    // because hand-assembling an access control list is where a mistake
+    // becomes a security hole rather than a wrong pixel.
+    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;AU)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut descriptor = ptr::null_mut();
+    let have_sd = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } != 0;
+
+    if !have_sd {
+        // No descriptor, no opinion. Config::save creates the directory
+        // itself when it must, so the record is still written; only the
+        // rights choice is lost, which is the pre-existing behavior.
+        return;
+    }
+
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        CreateDirectoryW(wide.as_ptr(), &sa);
+        windows_sys::Win32::Foundation::LocalFree(descriptor as _);
     }
 }
 
@@ -395,14 +542,25 @@ impl Host {
         let lock = EngineLock::claim().ok_or("another instance already owns the fan")?;
         let channel = Channel::create().ok_or("could not publish the shared state")?;
 
-        let ec = Ec::open().map_err(|e| e.to_string())?;
-        // Which port layout the probe chose and what both answered, taken
-        // now because the handle disappears into the engine on the next
-        // line. The service writes it to the event log, so a report from a
-        // machine nobody can test says which path was in use. The PawnIO
-        // version rides along: a version that could not be read does not
-        // stop startup, so this line is the one place that says the 2.2.0
-        // floor went unchecked.
+        let (ec, decided) = open_controller(&config).map_err(|e| e.to_string())?;
+
+        // The other mode is only worth suggesting on a machine driving the
+        // mode its settings name. When the probe ran this boot, the other
+        // layout was just tried and rejected on evidence, so pointing an
+        // unreachable-controller message at it would send somebody to a
+        // setting that was already proven not to help.
+        let layout_hint = if config.ec_layout.is_some() {
+            other_mode_hint(ec.layout())
+        } else {
+            ipc::LAYOUT_HINT_NONE
+        };
+
+        // How the controller is being reached and why, taken now because the
+        // handle disappears into the engine on the next line. The service
+        // writes it to the event log, so a report from a machine nobody can
+        // test says which path was in use. The PawnIO version rides along: a
+        // version that could not be read does not stop startup, so this line
+        // is the one place that says the 2.2.0 floor went unchecked.
         let ec_report =
             format!("{}. {}", ec.selection_summary(), yamato_ec::driver_version_report());
         let curve = config.active_curve().map_err(|e| e.to_string())?;
@@ -420,6 +578,21 @@ impl Host {
         // rather than at the next restart. That matters here, because the
         // machine that needs it is mid-failure when somebody turns it on.
         engine.set_single_fan(config.single_fan);
+
+        // A choice no unexamined layout could have beaten is written down,
+        // so the next start loads the layout instead of asking the hardware
+        // again. Compatibility mode chosen while the standard layout could
+        // not be examined is driven but not written, so an unlucky boot
+        // costs one more probe rather than a permanent wrong record.
+        // Written before the stamp below is read, which is what keeps this
+        // save from masquerading as an external edit: reload_if_changed
+        // compares mtimes against that stamp, and a stamp taken after the
+        // save already carries it, so the engine neither reloads over its
+        // own write nor writes again. Nothing here loops, because nothing
+        // in a reload writes.
+        if let Some(layout) = decided {
+            remember_layout(&Config::default_path(), layout);
+        }
 
         Ok(Host {
             engine,
@@ -447,6 +620,7 @@ impl Host {
                 .ok(),
             logger: crate::log::Logger::new(crate::log::default_path()),
             ec_report,
+            layout_hint,
             stop,
             _lock: lock,
         })
@@ -870,6 +1044,9 @@ impl Host {
             Mode::Manual(_) => ipc::MODE_MANUAL,
         };
 
+        let layout_hint =
+            layout_hint_to_publish(self.layout_hint, fault, self.consecutive_faults);
+
         self.channel.publish(
             fan_ctrl,
             mode,
@@ -880,6 +1057,7 @@ impl Host {
             fault || self.handback_failed || self.surrendered.is_some(),
             status_for(fault, self.surrendered.is_some(), self.handback_failed),
             self.fan_write_declined,
+            layout_hint,
             self.publish_interval_secs(),
         );
 
@@ -1207,6 +1385,116 @@ mod tests {
             assert_ne!(status_for(fault, surrendered, handback), ipc::STATUS_OK);
             assert!(published_fault, "an unhealthy state that no reader would show");
         }
+    }
+
+    fn temp_config(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("yamato-host-{tag}-{}.json", std::process::id()));
+        p
+    }
+
+    #[test]
+    fn the_probed_layout_is_written_down_beside_everything_else() {
+        // The record is one field in a file two other programs also write,
+        // so it has to land without taking anything of theirs with it.
+        let path = temp_config("remember");
+        let cfg = Config { poll_secs: 9, ..Config::default() };
+        cfg.save(&path).unwrap();
+
+        remember_layout(&path, yamato_core::EcLayout::Compat);
+
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back.ec_layout, Some(yamato_core::EcLayout::Compat));
+        assert_eq!(back.poll_secs, 9, "recording the layout must not move other settings");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_layout_somebody_already_chose_is_not_overwritten_by_the_probe() {
+        // The settings row can be clicked while the first boot's probe is
+        // still running. Whoever wrote a concrete answer first wins, and it
+        // is not the probe: an override exists precisely to outrank it.
+        let path = temp_config("decided");
+        let cfg = Config { ec_layout: Some(yamato_core::EcLayout::Compat), ..Config::default() };
+        cfg.save(&path).unwrap();
+
+        remember_layout(&path, yamato_core::EcLayout::Standard);
+
+        assert_eq!(
+            Config::load(&path).unwrap().ec_layout,
+            Some(yamato_core::EcLayout::Compat),
+            "the probe's answer replaced a person's"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_settings_file_that_does_not_parse_is_left_exactly_alone() {
+        // Replacing a broken file with defaults plus one field would destroy
+        // whatever the broken file still holds of someone's curves. The
+        // record is skipped instead; the next boot probes again.
+        let path = temp_config("broken");
+        std::fs::write(&path, "not json").unwrap();
+
+        remember_layout(&path, yamato_core::EcLayout::Standard);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_fresh_install_still_gets_its_record() {
+        // The first boot of a fresh install has no settings file at all, and
+        // that is exactly the boot whose probe result matters most: missing
+        // it would mean probing on every boot until somebody happened to
+        // touch a setting.
+        let path = temp_config("fresh");
+        let _ = std::fs::remove_file(&path);
+
+        remember_layout(&path, yamato_core::EcLayout::Standard);
+
+        assert_eq!(
+            Config::load(&path).unwrap().ec_layout,
+            Some(yamato_core::EcLayout::Standard)
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_hint_points_at_the_mode_not_being_driven() {
+        // Suggesting the mode already failing would be advice to do nothing.
+        assert_eq!(other_mode_hint(yamato_ec::Layout::Standard), ipc::LAYOUT_HINT_TRY_COMPAT);
+        assert_eq!(
+            other_mode_hint(yamato_ec::Layout::Alternate),
+            ipc::LAYOUT_HINT_TRY_STANDARD
+        );
+    }
+
+    #[test]
+    fn the_hint_waits_for_a_run_of_failures_and_leaves_with_them() {
+        let hint = ipc::LAYOUT_HINT_TRY_COMPAT;
+
+        // A blip is not a diagnosis: one failed pass, or several, stays
+        // quiet until the run reaches the same threshold the engine hands
+        // the fan back on.
+        assert_eq!(layout_hint_to_publish(hint, true, 1), ipc::LAYOUT_HINT_NONE);
+        assert_eq!(layout_hint_to_publish(hint, true, MAX_FAULTS - 1), ipc::LAYOUT_HINT_NONE);
+        assert_eq!(layout_hint_to_publish(hint, true, MAX_FAULTS), hint);
+
+        // A pass that is not a fault carries no suggestion whatever the
+        // counter says: stale republication of a good reading is not
+        // trouble, and a healthy pass is about to reset the count anyway.
+        assert_eq!(layout_hint_to_publish(hint, false, MAX_FAULTS), ipc::LAYOUT_HINT_NONE);
+
+        // A boot that probed has nothing to suggest, however bad it gets.
+        assert_eq!(
+            layout_hint_to_publish(ipc::LAYOUT_HINT_NONE, true, MAX_FAULTS * 3),
+            ipc::LAYOUT_HINT_NONE
+        );
     }
 
     #[test]

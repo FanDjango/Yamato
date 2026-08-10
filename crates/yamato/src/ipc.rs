@@ -120,6 +120,38 @@ pub fn status_words(status: u8, fault: bool) -> Option<(&'static str, &'static s
 pub const SINGLE_FAN_HINT: &str =
     "This may be a single-fan machine. Set Fans to Single in Settings.";
 
+/// No suggestion about the controller mode. The zero, so a section written
+/// by an engine from before the field existed reads as nothing to say.
+pub const LAYOUT_HINT_NONE: u8 = 0;
+/// The engine is driving the standard ports, as configured, and cannot reach
+/// the controller: the machine may be one that needs Compatibility mode.
+pub const LAYOUT_HINT_TRY_COMPAT: u8 = 1;
+/// The other way around: Compatibility mode is configured and unreachable.
+pub const LAYOUT_HINT_TRY_STANDARD: u8 = 2;
+
+/// The sentence for each direction, or nothing.
+///
+/// Offered when the controller has been unreachable for a run of passes on a
+/// machine driving the layout its settings name. A machine that needs
+/// Compatibility mode looks identical to one that is not supported at all,
+/// and only this side of the screen can tell the difference: one of them is a
+/// setting away from working. Worded to suggest, like the single-fan hint,
+/// and naming the exact words the settings row shows, so what the tooltip
+/// says to try is what the window says it is. Takes the detail line's place
+/// in the tooltip, so each has to fit beside every headline; a test holds
+/// them to that.
+pub fn layout_hint_words(hint: u8) -> Option<&'static str> {
+    match hint {
+        LAYOUT_HINT_TRY_COMPAT => {
+            Some("Some ThinkPads need Compatibility mode. Try it in Settings.")
+        }
+        LAYOUT_HINT_TRY_STANDARD => {
+            Some("This machine may not need Compatibility mode. Try Standard in Settings.")
+        }
+        _ => None,
+    }
+}
+
 /// "Change the profile, leave the mode alone."
 ///
 /// Echoing back the mode the engine just published is not harmless. Echoing
@@ -187,6 +219,13 @@ pub struct Shared {
     /// setting that ends it. The pairing and the remembering are the client's
     /// job; the engine only says what kind of failure it is having.
     pub fan_write_declined: u8,
+
+    /// One of the `LAYOUT_HINT_` values: the controller mode worth suggesting,
+    /// when the engine is driving the mode its settings name and has not
+    /// reached the controller for a run of passes. In the last padding byte
+    /// the compiler was leaving, so nothing moves and nothing grows, and an
+    /// older engine leaves the zero that means nothing to say.
+    pub layout_hint: u8,
 }
 
 impl Shared {
@@ -341,6 +380,7 @@ impl Channel {
         fault: bool,
         status: u8,
         fan_write_declined: bool,
+        layout_hint: u8,
         publish_secs: u16,
     ) {
         debug_assert!(self.owner, "only the engine publishes");
@@ -352,6 +392,7 @@ impl Channel {
         s.fault = u8::from(fault);
         s.status = status;
         s.fan_write_declined = u8::from(fan_write_declined);
+        s.layout_hint = layout_hint;
         s.publish_secs = publish_secs.max(1);
 
         let (idx, temp) = hottest.unwrap_or((0, 0));
@@ -581,12 +622,42 @@ mod tests {
     #[test]
     fn the_single_fan_hint_fits_beside_every_headline() {
         // The hint takes the detail line's place in the tooltip, so it has to
-        // fit under whichever headline the trouble is wearing.
-        for status in [STATUS_UNREACHABLE, STATUS_SURRENDERED, STATUS_HANDBACK_FAILED] {
-            let (headline, _) = status_words(status, true).unwrap();
-            let tip = format!("Yamato\n{headline}\n{SINGLE_FAN_HINT}");
+        // fit under whichever headline the trouble is wearing. The layout
+        // hints ride the same line, so the same rule holds them, and both of
+        // those must spell the mode out: "Compatibility" is the word the
+        // settings row shows, and an abbreviation here would send somebody
+        // looking for a control that does not exist.
+        let mut hints = vec![SINGLE_FAN_HINT];
 
-            assert!(tip.encode_utf16().count() < 128, "{tip}");
+        for direction in [LAYOUT_HINT_TRY_COMPAT, LAYOUT_HINT_TRY_STANDARD] {
+            let words = layout_hint_words(direction).expect("a direction with no words");
+            assert!(words.contains("Compatibility"), "{words}");
+            assert!(words.contains("Settings"), "{words}");
+            hints.push(words);
         }
+
+        for hint in hints {
+            for status in [STATUS_UNREACHABLE, STATUS_SURRENDERED, STATUS_HANDBACK_FAILED] {
+                let (headline, _) = status_words(status, true).unwrap();
+                let tip = format!("Yamato\n{headline}\n{hint}");
+
+                assert!(tip.encode_utf16().count() < 128, "{tip}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_engine_with_nothing_to_suggest_writes_the_resting_zero() {
+        // The section starts zeroed, and an older engine never writes the
+        // byte at all, so zero has to be the value that says nothing.
+        assert_eq!(LAYOUT_HINT_NONE, 0);
+        assert!(layout_hint_words(LAYOUT_HINT_NONE).is_none());
+
+        // And the two directions must not share a sentence: one of them
+        // tells somebody to switch a working machine's mode.
+        assert_ne!(
+            layout_hint_words(LAYOUT_HINT_TRY_COMPAT),
+            layout_hint_words(LAYOUT_HINT_TRY_STANDARD)
+        );
     }
 }

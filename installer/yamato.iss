@@ -46,13 +46,31 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "service"; Description: "Control the fan (installs the Yamato service - required, nothing works without it)"; GroupDescription: "Startup"
 Name: "trayicon"; Description: "Show the tray icon when I log in"; GroupDescription: "Startup"
 
+[Dirs]
+; The settings directory, created here rather than left to whoever saves
+; first.
+;
+; Two processes write it: the service, running as SYSTEM, which records which
+; controller layout the probe found, and the window, running as whoever logged
+; in. On a fresh install the service reaches it first, at the boot before
+; anybody has opened the window, and a directory SYSTEM created on NTFS can
+; leave files the window is then never able to replace. The symptom would be a
+; settings window that saves without complaint and changes nothing.
+;
+; Made once by the installer, which is elevated and runs before either of
+; them, with users granted modify so both sides can write for the life of the
+; install. The program keeps its own fallback for anyone running the service
+; without having installed it.
+Name: "{commonappdata}\{#AppName}"; Permissions: users-modify
+
 [Files]
 Source: "..\dist\{#AppExe}";           DestDir: "{app}"; Flags: ignoreversion
 ; The PawnIO modules are looked for next to the executable, not in the working
 ; directory, because a service and a run-key launch both start elsewhere.
 ; Both are installed on every machine: LpcACPIEC serves the standard EC ports
-; and LpcIO the 0x1600 window some ThinkPads use instead, and the engine
-; probes for which one this machine needs at startup.
+; and LpcIO the 0x1600 window some ThinkPads use instead. The engine probes
+; for which one this machine needs at its first start and remembers the
+; answer in its settings.
 Source: "..\dist\LpcACPIEC.bin";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\LpcIO.bin";           DestDir: "{app}"; Flags: ignoreversion
 ; The modules' sources, which the LGPL wants shipped with the objects rather

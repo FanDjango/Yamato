@@ -18,7 +18,10 @@
 //! depends on where this machine keeps its EC: the stock `LpcACPIEC` for the
 //! ACPI-specified ports, or `LpcIO` for the P53-class machines that put the
 //! controller at 0x1600/0x1604 instead. `Ec::open` probes both layouts and
-//! chooses on the evidence; nothing upstream needs to know which won.
+//! chooses on the evidence; the caller records the verdict and every later
+//! start drives it through `Ec::open_configured`, which probes nothing. A
+//! verdict that a layout nobody could examine might have outranked stays
+//! unrecorded, so the next start probes again: see `Ec::worth_recording`.
 
 mod ec;
 mod lock;
@@ -26,7 +29,8 @@ mod pawnio;
 mod version;
 
 pub use ec::{
-    Ec, EcState, Probe, FAN_BIOS, FAN_BITS, FAN_DISENGAGED, FAN_LEVEL_MAX, SENSOR_COUNT,
+    Ec, EcState, Probe, ProbeFailure, FAN_BIOS, FAN_BITS, FAN_DISENGAGED, FAN_LEVEL_MAX,
+    SENSOR_COUNT,
 };
 pub use pawnio::{Error, Layout, PawnIo, MODULE_FILES};
 pub use version::{
