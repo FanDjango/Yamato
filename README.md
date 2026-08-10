@@ -34,9 +34,8 @@
 >
 > It's MIT licensed, so fork it and do as you like. And
 > [TPFanControl][tpfc] and [its forks][fandjango] have done this well for
-> twenty years, are actively maintained, and support more machines than this
-> does. If Yamato doesn't suit your ThinkPad, they are the better answer, not
-> a consolation prize.
+> twenty years, are actively maintained, and may support more machines than this
+> does.
 
 ---
 
