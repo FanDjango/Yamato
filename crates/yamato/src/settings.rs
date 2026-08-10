@@ -14,6 +14,7 @@
 //! draws and routes input.
 
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, Interface, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -126,6 +127,19 @@ pub struct Settings {
     /// row that is no longer drawn.
     level_row: std::cell::Cell<(f32, f32, f32, f32)>,
     level_hot: std::cell::Cell<bool>,
+    /// A mode command that has been sent and not yet come back.
+    ///
+    /// Without this the rows are unusable. The engine publishes on its poll
+    /// interval, five seconds by default, and picks a command up on the same
+    /// pass, so for up to that long every sample still describes the mode
+    /// being left. Each one overwrote the row, which snapped back, and the
+    /// next click stepped from the old value and repeated the step just made.
+    /// That is the sticking: not a lost click, but a click undone.
+    ///
+    /// The level has the same problem twice over, because in Smart mode the
+    /// curve moves the control register between samples, so the number a step
+    /// counts from moves on its own even when nothing was clicked.
+    pending: Option<Pending>,
     /// Where the Save button was last drawn, for the same reason.
     save_button: std::cell::Cell<(f32, f32, f32, f32)>,
     /// Where Discard was last drawn, and empty while there is nothing to
@@ -219,6 +233,14 @@ pub struct Settings {
 /// copy.
 fn settings_on_disk() -> yamato_core::Config {
     yamato_core::Config::load(&yamato_core::Config::default_path()).unwrap_or_default()
+}
+
+/// What was asked for, and how long to keep showing it while waiting.
+#[derive(Clone, Copy)]
+struct Pending {
+    mode: u8,
+    level: u8,
+    deadline: Instant,
 }
 
 /// What the engine last reported. Everything here is displayed.
@@ -787,6 +809,7 @@ impl Settings {
                 mode_hot: std::cell::Cell::new(false),
                 level_row: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 level_hot: std::cell::Cell::new(false),
+                pending: None,
                 save_button: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 discard_button: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 picker_box: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
@@ -905,7 +928,7 @@ impl Settings {
         }
     }
 
-    /// Sends a mode, and shows it immediately.
+    /// Sends a mode, and shows it until the engine agrees or stops answering.
     ///
     /// A command rather than a config write, because the mode is the engine's
     /// to hold: the file says what to start in, not what is running now.
@@ -918,23 +941,53 @@ impl Settings {
         // selected is not a statement about who should drive the fan.
         channel.post_command(mode, level, "");
 
-        // Shown now rather than a poll later, so the row answers the click it
-        // was given. The next readout from the engine overwrites all of this
-        // with the truth, which is the point: if the command did not take,
-        // the rows go back on their own instead of lying until something else
-        // changes them.
-        self.readout.mode_raw = mode;
-        self.readout.mode = match mode {
+        // Two polls and a little, because the command is picked up on a pass
+        // and its result published by the next one. Waiting a fixed few
+        // seconds instead would expire early on a slow poll and leave the row
+        // snapping back, which is the bug this exists to fix.
+        let wait = Duration::from_secs(u64::from(self.config.poll_secs) * 2 + 2);
+
+        self.pending = Some(Pending { mode, level, deadline: Instant::now() + wait });
+        self.show_pending();
+        self.invalidate();
+    }
+
+    /// Decides whether the outstanding command has landed, and holds the rows
+    /// on what was asked for until it has.
+    ///
+    /// The deadline matters as much as the match does. A command that never
+    /// arrives -- an engine that has stopped, a write the controller refused
+    /// -- must stop being shown, or the window would report a mode nothing is
+    /// running. When it expires the rows go back to the truth on their own.
+    fn settle_pending(&mut self) {
+        let Some(p) = self.pending else { return };
+
+        let arrived = self.readout.mode_raw == p.mode
+            && (p.mode != crate::ipc::MODE_MANUAL || self.readout.fan_ctrl == p.level);
+
+        if arrived || Instant::now() >= p.deadline {
+            self.pending = None;
+            return;
+        }
+
+        self.show_pending();
+    }
+
+    /// Writes the outstanding command over the readout, so every part of this
+    /// window agrees: what is drawn, and what the next click counts from.
+    fn show_pending(&mut self) {
+        let Some(p) = self.pending else { return };
+
+        self.readout.mode_raw = p.mode;
+        self.readout.mode = match p.mode {
             crate::ipc::MODE_SMART => "Smart",
             crate::ipc::MODE_MANUAL => "Manual",
             _ => "BIOS",
         };
 
-        if mode == crate::ipc::MODE_MANUAL {
-            self.readout.fan_ctrl = level;
+        if p.mode == crate::ipc::MODE_MANUAL {
+            self.readout.fan_ctrl = p.level;
         }
-
-        self.invalidate();
     }
 
     fn show_profile_menu(&mut self) {
@@ -1342,6 +1395,7 @@ impl Settings {
     pub fn set_readout(&mut self, readout: Readout) {
         self.editor.set_live_temp(readout.hottest.map(|(_, t)| t));
         self.readout = readout;
+        self.settle_pending();
         // Picked up here because this is the one thing that happens on every
         // tick, so choosing Fahrenheit in the tray shows up in an open window
         // within a sample instead of not at all.
