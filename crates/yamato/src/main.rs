@@ -28,6 +28,7 @@
 //! Anything else is a client that never opens the port driver, so it cannot
 //! write the fan register however it is asked to.
 
+mod about;
 mod curve_editor;
 mod engine_host;
 mod icon;
@@ -80,11 +81,39 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Help => {
-            print_usage();
-            ExitCode::SUCCESS
-        }
+        Command::Help => run_help(),
     }
+}
+
+/// Answers `--help`, or any argument this program does not understand.
+///
+/// A windows-subsystem binary starts with no console, so a plain println!
+/// here went to a handle nobody holds and the usage text reached no one.
+/// Attaching to the console of whoever launched us puts the answer in the
+/// terminal that asked, which is where somebody typing --help is looking.
+/// Started from Explorer or a shortcut there is no console to attach to, and
+/// then the About box carries the same name, version and identity on screen,
+/// which beats both silence and a console flashing into existence.
+fn run_help() -> ExitCode {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
+        // The shell printed its prompt before we attached, so start on a
+        // fresh line rather than appending to it.
+        println!();
+        print_usage();
+    } else {
+        // Same reason run_tray gives: the shell wants an apartment on any
+        // thread that calls ShellExecute, which the box's two buttons do.
+        unsafe {
+            use windows_sys::Win32::System::Ole::OleInitialize;
+            OleInitialize(std::ptr::null_mut());
+        }
+
+        about::show(std::ptr::null_mut());
+    }
+
+    ExitCode::SUCCESS
 }
 
 #[derive(Debug, PartialEq, Eq)]

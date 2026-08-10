@@ -36,6 +36,9 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Controls",
+    # DwmSetWindowAttribute, so the About box's title bar is dark like the
+    # window under it rather than a white strip above it.
+    "Win32_Graphics_Dwm",
     # GetOpenFileNameW, for picking a TPFanControl ini to import.
     # OleInitialize: the shell wants an apartment on the thread that talks to
     # it, and this one runs the file dialog and ShellExecute.

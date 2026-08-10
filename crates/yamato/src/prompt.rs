@@ -41,7 +41,7 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Where to put the box so it lands where the eye already is.
+/// Where to put a box of the given size so it lands where the eye already is.
 ///
 /// CW_USEDEFAULT is only honored for overlapped windows. A popup given it goes
 /// to the top-left corner of the primary display, so the box appeared in one
@@ -50,7 +50,10 @@ fn wide(s: &str) -> Vec<u16> {
 ///
 /// Centered on the owner when there is one on screen. The tray's window is
 /// real but never shown, so the fallback is the display the pointer is on.
-fn centered(owner: HWND) -> (i32, i32) {
+///
+/// Shared with the About box, which is why the size is a parameter rather
+/// than this file's own constants.
+pub(crate) fn centered(owner: HWND, width: i32, height: i32) -> (i32, i32) {
     let mut area = RECT { left: 0, top: 0, right: 0, bottom: 0 };
 
     let on_owner = !owner.is_null()
@@ -75,8 +78,8 @@ fn centered(owner: HWND) -> (i32, i32) {
     }
 
     (
-        area.left + (area.right - area.left - WIDTH) / 2,
-        area.top + (area.bottom - area.top - HEIGHT) / 2,
+        area.left + (area.right - area.left - width) / 2,
+        area.top + (area.bottom - area.top - height) / 2,
     )
 }
 
@@ -105,7 +108,7 @@ pub fn ask(owner: HWND, title: &str, initial: &str) -> Option<String> {
 
         RESULT.with(|r| *r.borrow_mut() = None);
 
-        let (x, y) = centered(owner);
+        let (x, y) = centered(owner, WIDTH, HEIGHT);
 
         let window = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,

@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: MIT
+#
+# Yamato - fan control software for ThinkPads
+# Copyright (c) 2026 David Brustein
+#
+# Builds an installer on demand. Manual only: there is no push or pull_request
+# trigger, deliberately. A release is a thing somebody decides to cut, and a
+# workflow that fires on every commit spends runner minutes proving what the
+# local build already proved.
+#
+# The version typed in is written into Cargo.toml and the installer script by
+# version.ps1, exactly the way build.cmd does it locally, and then thrown away
+# with the runner. Nothing is committed and nothing is tagged: this produces a
+# setup file to test, and cutting the release stays a separate decision made
+# with the artifact in hand.
+
+name: Build installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp the build with, e.g. 1.0.3"
+        required: true
+        type: string
+      publish:
+        description: "Also create a draft release with the installer attached"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # Write, only because the optional draft-release step at the end needs it.
+    # Permissions cannot be made conditional on an input, so the narrower
+    # read above is the default for anything else added to this file later.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image ships a current stable toolchain, so this is a
+      # no-op most days. It is here so a build is never held back by whatever
+      # rustc the image happened to freeze on.
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+
+      # actions/cache rather than a Rust-specific action: this is one job with
+      # one profile, the paths are not a mystery, and it is one less
+      # third-party action in the chain that produces a signed-adjacent
+      # artifact. The lockfile keys it, so a dependency change gets a fresh
+      # cache and everything else reuses one.
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Check the version is a version
+        shell: pwsh
+        run: |
+          $v = '${{ inputs.version }}'.Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') {
+            throw "version '$v' is not major.minor.patch"
+          }
+          "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Writes it to Cargo.toml and installer\yamato.iss, the one place it is
+      # defined and the one place it is duplicated.
+      - name: Stamp the version
+        shell: pwsh
+        run: ./version.ps1 $env:VERSION
+
+      # The same remapping build.cmd does, for the same reason: rustc bakes
+      # absolute source paths into panic messages and debug info, and on a
+      # runner those name the layout of a throwaway machine rather than
+      # anything anybody needs. scrub-check below refuses a build that still
+      # carries them, and it looks for the registry and toolchain paths too,
+      # not only the source tree.
+      #
+      # Order matters and runs backwards: rustc walks the mappings in reverse,
+      # so the most specific has to come last or the broad profile rule
+      # swallows everything and the registry layout ships anyway.
+      #
+      # Set once for the whole job rather than on the build step. Changing
+      # RUSTFLAGS invalidates the build cache, so tests compiled without them
+      # would mean compiling the world twice and caching neither half.
+      - name: Set the path remapping
+        shell: pwsh
+        run: |
+          $u = $env:USERPROFILE
+          $flags = @(
+            "--remap-path-prefix=$u=home"
+            "--remap-path-prefix=$u\.rustup=rust"
+            "--remap-path-prefix=$u\.cargo=cargo"
+            "--remap-path-prefix=$u\.cargo\registry\src=deps"
+            "--remap-path-prefix=$($PWD.Path)=yamato"
+          ) -join ' '
+          "RUSTFLAGS=$flags" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Tests first. This program drives cooling hardware; shipping a build
+      # whose fan-curve tests fail is not a trade worth making.
+      - name: Test
+        shell: pwsh
+        run: cargo test --workspace --release
+
+      - name: Build
+        shell: pwsh
+        run: cargo build --workspace --release
+
+      - name: Check the binary carries no local paths
+        shell: pwsh
+        run: ./scrub-check.ps1 target\release\yamato.exe
+
+      # Everything that has to sit next to yamato.exe. The two PawnIO modules
+      # both ship on every machine, because which one the engine needs depends
+      # on where that machine keeps its EC and it decides by probing. Their
+      # sources ship beside them, which is what the LGPL asks for.
+      - name: Stage dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\yamato.exe dist\ -Force
+          Copy-Item assets\LpcACPIEC.bin, assets\LpcIO.bin dist\ -Force
+          Copy-Item assets\LpcACPIEC.p, assets\LpcIO.p dist\ -Force
+          Copy-Item LICENSE, LICENSE.LGPL-2.1.txt, NOTICE.md, THIRD-PARTY-LICENSES.txt dist\ -Force
+
+      # Inno Setup ships on the windows runner images, 6.7.1 at the time of
+      # writing. Looked for rather than assumed, in the two Program Files
+      # directories and then anywhere on PATH, and installed if the image has
+      # dropped it. A runner image is not a contract, and the alternative to
+      # this is a workflow that starts failing on a Tuesday for reasons that
+      # have nothing to do with the code.
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          function Find-Iscc {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            )
+
+            foreach ($c in $candidates) {
+              if (Test-Path $c) { return $c }
+            }
+
+            $onPath = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($onPath) { return $onPath.Source }
+
+            return $null
+          }
+
+          $iscc = Find-Iscc
+
+          if (-not $iscc) {
+            Write-Host "Inno Setup is not on this image; installing it."
+            choco install innosetup --no-progress -y
+            $iscc = Find-Iscc
+          }
+
+          if (-not $iscc) { throw "Inno Setup 6 was not found and could not be installed" }
+
+          Write-Host "Using $iscc"
+          & $iscc installer\yamato.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+          $setup = "dist\Yamato-$env:VERSION-setup.exe"
+          if (-not (Test-Path $setup)) { throw "ISCC reported success but $setup is not there" }
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yamato-${{ env.VERSION }}-setup
+          path: dist/Yamato-${{ env.VERSION }}-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # Off unless asked for, and a draft even then, so the artifact above is
+      # the normal outcome and publishing stays a thing somebody clicks.
+      - name: Draft a release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "v$env:VERSION" `
+            "dist\Yamato-$env:VERSION-setup.exe" `
+            --draft `
+            --title "Yamato $env:VERSION" `
+            --notes "Built from ${{ github.sha }}."

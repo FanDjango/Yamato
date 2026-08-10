@@ -353,6 +353,7 @@ const ID_PAWNIO: usize = 304;
 const ID_LOGGING: usize = 402;
 const ID_LOG_FOLDER: usize = 403;
 const ID_TRAY_NUMBERS: usize = 404;
+const ID_ABOUT: usize = 405;
 
 /// "Hottest" sits on the base, then one id per sensor above it. Well clear of
 /// the manual levels below and the profile list above.
@@ -1254,6 +1255,13 @@ impl Tray {
             AppendMenuW(menu, MF_STRING, ID_LOG_FOLDER, wide("Open log folder").as_ptr());
 
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+
+            // The customary bottom group: what this program is, then the way
+            // out. The About box carries the version, the warnings and the
+            // attributions, and this menu is the only surface Yamato has, so
+            // this is the one place those can be reachable from.
+            AppendMenuW(menu, MF_STRING, ID_ABOUT, wide("About Yamato...").as_ptr());
+
             // Named for what it does, which is both halves: the tray goes and
             // so does the fan control. Stopping the service asks for
             // administrator rights, and hands the fan back to the firmware on
@@ -1335,6 +1343,7 @@ impl Tray {
             }
             ID_LOGGING => self.toggle_logging(),
             ID_LOG_FOLDER => open_log_folder(),
+            ID_ABOUT => self.show_about(),
             ID_STARTUP => {
                 crate::startup::toggle();
             }
@@ -1685,6 +1694,18 @@ impl Tray {
         }
     }
 
+    /// Shows the About box: the version, the warnings, and the attributions.
+    ///
+    /// It runs a message loop of its own, so it takes the pause for the same
+    /// reason every modal here does: a WM_TIMER dispatched from inside that
+    /// loop would re-enter the window procedure and take a second `&mut Tray`
+    /// while this call still holds one.
+    fn show_about(&self) {
+        let _pause = TimerPause::new(self.window);
+
+        crate::about::show(self.window);
+    }
+
     /// Flips between Celsius and Fahrenheit, everywhere at once.
     ///
     /// Saved, not held in memory, so the window and the next session agree
@@ -2030,6 +2051,7 @@ mod tests {
             ID_EXIT,
             ID_PAWNIO,
             ID_TRAY_NUMBERS,
+            ID_ABOUT,
             ID_MANUAL_BASE + yamato_ec::FAN_LEVEL_MAX as usize - 1,
             ID_TRAY_SENSOR_BASE + yamato_ec::SENSOR_COUNT,
         ] {

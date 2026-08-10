@@ -123,7 +123,7 @@ pub fn diagnose(engine_running: bool) -> Missing {
     // from outside it: readable and below the floor refuses, unreadable is
     // not evidence of anything and says nothing. Checked before the module
     // files, because an old driver explains a dead engine on its own.
-    if let Some((found, _)) = yamato_ec::installed_driver_version() {
+    if let Some(found) = remembered_driver_version() {
         if found < MIN_DRIVER_VERSION {
             return Missing::Outdated(found);
         }
@@ -133,6 +133,44 @@ pub fn diagnose(engine_running: bool) -> Missing {
         Some(path) => Missing::Module(path),
         None => Missing::Nothing,
     }
+}
+
+/// The installed driver's version, read at most once in a while.
+///
+/// Reading it means a registry lookup and then a version resource off a file
+/// in the driver store, and this is asked on every tooltip refresh, which is
+/// once a second, and again on every menu build. That is file I/O on the
+/// thread that draws, and on a cold path it showed as the window stopping for
+/// a moment before the menu appeared.
+///
+/// A version cannot change without PawnIO being reinstalled, so remembering
+/// it costs nothing in accuracy. The expiry is here only so that installing
+/// PawnIO while the tray is open is noticed without having to restart it.
+fn remembered_driver_version() -> Option<DriverVersion> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const GOOD_FOR: Duration = Duration::from_secs(30);
+
+    static REMEMBERED: Mutex<Option<(Instant, Option<DriverVersion>)>> = Mutex::new(None);
+
+    // A poisoned lock here would mean a panic while holding it, which this
+    // cannot do: everything inside is a read. Falling back to asking the
+    // system directly is still the right answer over refusing to answer.
+    let Ok(mut slot) = REMEMBERED.lock() else {
+        return yamato_ec::installed_driver_version().map(|(v, _)| v);
+    };
+
+    if let Some((read_at, version)) = *slot {
+        if read_at.elapsed() < GOOD_FOR {
+            return version;
+        }
+    }
+
+    let version = yamato_ec::installed_driver_version().map(|(v, _)| v);
+    *slot = Some((Instant::now(), version));
+
+    version
 }
 
 /// Whether TPFanControl or TPFanCtrl2 appears to be running.

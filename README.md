@@ -9,7 +9,7 @@
 **Not affiliated with, endorsed by, or supported by Lenovo.**
 
 [![Release](https://img.shields.io/github/v/release/mackid1993/Yamato?style=flat-square&color=ce1b22&label=release)](https://github.com/mackid1993/Yamato/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/mackid1993/Yamato/total?style=flat-square&color=ce1b22)](https://github.com/mackid1993/Yamato/releases)
+[![Downloads](https://img.shields.io/github/downloads/mackid1993/Yamato/total?style=flat-square&color=ce1b22&cacheSeconds=3600)](https://github.com/mackid1993/Yamato/releases)
 ![Platform](https://img.shields.io/badge/windows-10%201809%2B%20x64-ce1b22?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-ce1b22?style=flat-square)
 
@@ -264,8 +264,8 @@ light against a dark window because the dark-mode attribute isn't there yet.
 Rounded corners are Windows 11 only and are skipped quietly everywhere else.
 Neither is worth caring about, so 1809 is the number to go by.
 
-Yamato does not bundle PawnIO. It's GPL-2.0, and shipping the driver would
-mean shipping its source; pointing at the download doesn't. The installer
+Yamato does not bundle PawnIO. It's GPL-2.0-or-later, and shipping the driver
+would mean shipping its source; pointing at the download doesn't. The installer
 checks that it is there and new enough and offers to open the page, and the
 tray keeps a link to it.
 

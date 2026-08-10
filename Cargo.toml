@@ -7,7 +7,7 @@ version = "1.0.2"
 edition = "2021"
 license = "MIT"
 authors = ["David Brustein <david@brustein.net>"]
-repository = "https://github.com/mackid1993/yamato"
+repository = "https://github.com/mackid1993/Yamato"
 rust-version = "1.75"
 
 [workspace.dependencies]
