@@ -121,6 +121,11 @@ pub struct Settings {
     /// these rows are live, and a color alone reads as decoration.
     profile_hot: std::cell::Cell<bool>,
     mode_hot: std::cell::Cell<bool>,
+    /// The Level row, which exists only while a level is being held. Its
+    /// rectangle is cleared in every other mode, so a click cannot land on a
+    /// row that is no longer drawn.
+    level_row: std::cell::Cell<(f32, f32, f32, f32)>,
+    level_hot: std::cell::Cell<bool>,
     /// Where the Save button was last drawn, for the same reason.
     save_button: std::cell::Cell<(f32, f32, f32, f32)>,
     /// Where Discard was last drawn, and empty while there is nothing to
@@ -227,6 +232,11 @@ pub struct Readout {
     /// for reading; this is for deciding, and clicking the Mode row needs to
     /// know what it is switching away from without matching on prose.
     pub mode_raw: u8,
+    /// The fan control register as the engine last saw it: a level in 0..=7,
+    /// or `FAN_BIOS`, or the disengaged value this program refuses to set.
+    /// The Level row reads a level out of it, and entering a held level
+    /// starts from whatever the fan was already doing.
+    pub fan_ctrl: u8,
     pub profile: String,
     pub fault: bool,
     /// Which kind of trouble, as one of the `ipc::STATUS_` values. Zero when
@@ -775,6 +785,8 @@ impl Settings {
                 mode_row: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 profile_hot: std::cell::Cell::new(false),
                 mode_hot: std::cell::Cell::new(false),
+                level_row: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
+                level_hot: std::cell::Cell::new(false),
                 save_button: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 discard_button: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
                 picker_box: std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)),
@@ -853,23 +865,75 @@ impl Settings {
     fn cycle_mode(&mut self) {
         let next = match self.readout.mode_raw {
             crate::ipc::MODE_BIOS => crate::ipc::MODE_SMART,
+            crate::ipc::MODE_SMART => crate::ipc::MODE_MANUAL,
             _ => crate::ipc::MODE_BIOS,
         };
 
+        // Entering a held level starts from the one the fan is already
+        // running at, which in Smart mode is whatever the curve just asked
+        // for. Landing on the current speed makes this a change of who is
+        // deciding rather than a change of speed, and it means the step never
+        // arrives as a sudden quiet or a sudden roar.
+        let level = if next == crate::ipc::MODE_MANUAL { self.held_level() } else { 0 };
+
+        self.post_mode(next, level);
+    }
+
+    /// Steps the held level, 1 through 7 and back to 1.
+    ///
+    /// Zero is not in the ring. It is a level the controller accepts and this
+    /// program refuses to hold, because it means the fan stops with the
+    /// firmware's own thermal management switched off, and the way out of it
+    /// is a temperature limit rather than a fan.
+    fn cycle_level(&mut self) {
+        let next = self.held_level() % yamato_ec::FAN_LEVEL_MAX + 1;
+
+        self.post_mode(crate::ipc::MODE_MANUAL, next);
+    }
+
+    /// The level to show, and the one a step counts from.
+    ///
+    /// Read out of the control register rather than remembered, so it follows
+    /// the engine. Anything that is not a level it makes sense to hold -- the
+    /// firmware's own value, the disengaged one, or zero -- answers with a
+    /// middle level instead, which is what entering a held level from BIOS
+    /// mode has to start at when there is no level to inherit.
+    fn held_level(&self) -> u8 {
+        match self.readout.fan_ctrl {
+            l @ 1..=yamato_ec::FAN_LEVEL_MAX => l,
+            _ => 4,
+        }
+    }
+
+    /// Sends a mode, and shows it immediately.
+    ///
+    /// A command rather than a config write, because the mode is the engine's
+    /// to hold: the file says what to start in, not what is running now.
+    fn post_mode(&mut self, mode: u8, level: u8) {
         let Some(channel) = crate::ipc::Channel::attach() else {
             return;
         };
 
         // The empty name is "leave the profile alone". Which curve is
         // selected is not a statement about who should drive the fan.
-        channel.post_command(next, 0, "");
+        channel.post_command(mode, level, "");
 
-        // Show it now rather than a poll later, so the row answers the click
-        // it was given. The next readout from the engine overwrites this with
-        // the truth, which is the point: if the command did not take, the row
-        // goes back on its own instead of lying until something else changes.
-        self.readout.mode_raw = next;
-        self.readout.mode = if next == crate::ipc::MODE_SMART { "Smart" } else { "BIOS" };
+        // Shown now rather than a poll later, so the row answers the click it
+        // was given. The next readout from the engine overwrites all of this
+        // with the truth, which is the point: if the command did not take,
+        // the rows go back on their own instead of lying until something else
+        // changes them.
+        self.readout.mode_raw = mode;
+        self.readout.mode = match mode {
+            crate::ipc::MODE_SMART => "Smart",
+            crate::ipc::MODE_MANUAL => "Manual",
+            _ => "BIOS",
+        };
+
+        if mode == crate::ipc::MODE_MANUAL {
+            self.readout.fan_ctrl = level;
+        }
+
         self.invalidate();
     }
 
@@ -2552,11 +2616,12 @@ impl Settings {
         // only clickable things in this window with no label saying so, and
         // an accent color and a highlight tell somebody that a row does
         // something without telling them what.
-        // Kept to the two lines this box holds. A fixed level is not
-        // mentioned because clicking cannot reach one: that is the tray's
-        // submenu, and on purpose.
+        // Kept to the two lines this box holds.
         let hint = if self.mode_hot.get() {
-            "Click Mode to hand the fan to the firmware, or back to your curve."
+            "Click Mode for the firmware, your curve, or a level you hold yourself."
+        } else if self.level_hot.get() {
+            "Click Level to step it, 1 to 7. A held level turns the firmware's own \
+             thermal management off."
         } else if self.profile_hot.get() {
             "Click Profile to switch curves, or to add, rename or delete one."
         } else {
@@ -2690,6 +2755,7 @@ impl Settings {
             // paint would answer a click in what is now empty panel.
             self.profile_row.set((0.0, 0.0, 0.0, 0.0));
             self.mode_row.set((0.0, 0.0, 0.0, 0.0));
+            self.level_row.set((0.0, 0.0, 0.0, 0.0));
             self.sensor_rows.set((0.0, 0.0, 0.0, 0.0));
 
             // A fault is a state, not a crash. Centered, calm, and it says
@@ -2802,6 +2868,27 @@ impl Settings {
         self.kv_row(target, cl, cr, y, row, "Mode", self.readout.mode, theme::ACCENT)?;
         self.mode_row.set((cl, y, cr, y + row));
         y += row;
+
+        // Only while a level is held. Nothing below moves when it is absent
+        // because the whole column is laid out from a running y, so the row
+        // appears and disappears without leaving a gap where it was.
+        if self.readout.mode_raw == crate::ipc::MODE_MANUAL {
+            self.row_wash(target, cl, cr, y, row, self.level_hot.get())?;
+            self.kv_row(
+                target,
+                cl,
+                cr,
+                y,
+                row,
+                "Level",
+                &self.held_level().to_string(),
+                theme::ACCENT,
+            )?;
+            self.level_row.set((cl, y, cr, y + row));
+            y += row;
+        } else {
+            self.level_row.set((0.0, 0.0, 0.0, 0.0));
+        }
         // Drawn in the accent color, because unlike its neighbors this row
         // does something when clicked.
         self.row_wash(target, cl, cr, y, row, self.profile_hot.get())?;
@@ -3074,6 +3161,12 @@ unsafe extern "system" fn wnd_proc(
                     return LRESULT(0);
                 }
 
+                let (ll, lt, lr, lb) = this.level_row.get();
+                if lr > ll && x >= ll && x <= lr && y >= lt && y <= lb {
+                    this.cycle_level();
+                    return LRESULT(0);
+                }
+
                 let (dl, dt, dr, db) = this.discard_button.get();
                 if dr > dl && x >= dl && x <= dr && y >= dt && y <= db {
                     this.discard_edits();
@@ -3139,9 +3232,11 @@ unsafe extern "system" fn wnd_proc(
                 // and against the same rectangles the click is tested with.
                 // An empty rectangle is the fault state, where nothing
                 // clickable is drawn, and a zero-width test never matches.
-                for (rect, flag) in
-                    [(this.mode_row.get(), &this.mode_hot), (this.profile_row.get(), &this.profile_hot)]
-                {
+                for (rect, flag) in [
+                    (this.mode_row.get(), &this.mode_hot),
+                    (this.level_row.get(), &this.level_hot),
+                    (this.profile_row.get(), &this.profile_hot),
+                ] {
                     let (l, t, r, b) = rect;
                     let over = r > l && x >= l && x <= r && y >= t && y <= b;
 

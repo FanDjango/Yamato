@@ -956,6 +956,7 @@ impl Tray {
                             _ => "BIOS",
                         },
                         mode_raw: s.mode,
+                        fan_ctrl: s.fan_ctrl,
                         profile: s.read_profile(),
                         fault: s.fault != 0,
                         status: s.status,
