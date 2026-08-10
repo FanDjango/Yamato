@@ -77,10 +77,28 @@ jobs:
           "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Writes it to Cargo.toml and installer\yamato.iss, the one place it is
-      # defined and the one place it is duplicated.
+      # defined and the one place it is duplicated. Checked rather than
+      # assumed: version.ps1 replaces by regular expression, and a silent miss
+      # would build the old version under the new name, which is the one kind
+      # of wrong build that looks exactly like a right one.
       - name: Stamp the version
         shell: pwsh
-        run: ./version.ps1 $env:VERSION
+        run: |
+          ./version.ps1 $env:VERSION
+
+          $cargo = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1
+          $iss = Select-String -Path installer\yamato.iss -Pattern '#define AppVersion\s+"([^"]+)"' |
+            Select-Object -First 1
+
+          $inCargo = $cargo.Matches[0].Groups[1].Value
+          $inIss = $iss.Matches[0].Groups[1].Value
+
+          Write-Host "Cargo.toml: $inCargo"
+          Write-Host "yamato.iss: $inIss"
+
+          if ($inCargo -ne $env:VERSION) { throw "Cargo.toml says $inCargo, not $env:VERSION" }
+          if ($inIss -ne $env:VERSION) { throw "yamato.iss says $inIss, not $env:VERSION" }
 
       # The same remapping build.cmd does, for the same reason: rustc bakes
       # absolute source paths into panic messages and debug info, and on a
