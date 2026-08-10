@@ -243,7 +243,7 @@ own testing. The `0x1600` window is confirmed reachable, measured four
 independent ways on a P1 Gen 7, but that machine keeps its controller at the
 standard ports, and no machine that actually lives at `0x1600` has run
 Yamato yet. If yours does, the application event log records which mode was
-chosen and why, and a report either way is welcome.
+chosen and why.
 
 Probing the layout a machine doesn't use is safe by construction, and since
 the probe runs once in the life of an install, it is also rare by
