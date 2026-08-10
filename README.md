@@ -8,8 +8,8 @@
 <br>
 **Not affiliated with, endorsed by, or supported by Lenovo.**
 
-[![Release](https://img.shields.io/github/v/release/mackid1993/Yamato?style=flat-square&color=ce1b22&label=release)](https://github.com/mackid1993/Yamato/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/mackid1993/Yamato/total?style=flat-square&color=ce1b22&cacheSeconds=3600)](https://github.com/mackid1993/Yamato/releases)
+[![Release](https://img.shields.io/github/v/release/mackid1993/Yamato?style=flat-square&color=ce1b22&label=release&cacheSeconds=300)](https://github.com/mackid1993/Yamato/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/mackid1993/Yamato/total?style=flat-square&color=ce1b22&cacheSeconds=300)](https://github.com/mackid1993/Yamato/releases)
 ![Platform](https://img.shields.io/badge/windows-10%201809%2B%20x64-ce1b22?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-ce1b22?style=flat-square)
 
