@@ -28,6 +28,11 @@ on:
         required: false
         default: false
         type: boolean
+      notes:
+        description: "Release notes. Ignored unless publish is on."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -210,10 +215,23 @@ jobs:
         if: ${{ inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # Through the environment, not spliced into the script below. Notes
+          # are prose typed by a person: a quote or a backtick in them would
+          # end the string and run the rest as PowerShell.
+          NOTES: ${{ inputs.notes }}
         shell: pwsh
         run: |
+          $notes = $env:NOTES
+
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            $notes = "Built from $env:GITHUB_SHA."
+          }
+
+          # A file rather than an argument, so newlines survive.
+          $notes | Out-File -FilePath notes.md -Encoding utf8
+
           gh release create "v$env:VERSION" `
             "dist\Yamato-$env:VERSION-setup.exe" `
             --draft `
             --title "Yamato $env:VERSION" `
-            --notes "Built from ${{ github.sha }}."
+            --notes-file notes.md
