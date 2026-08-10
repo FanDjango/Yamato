@@ -1390,9 +1390,28 @@ impl Settings {
             height: (rc.bottom - rc.top).max(1) as u32,
         };
 
+        // Software rasterizing, deliberately, and this is the single largest
+        // thing this program does for its memory footprint.
+        //
+        // The default asks for a hardware target, which creates a D3D device,
+        // which loads the graphics vendor's user-mode driver into this
+        // process and keeps it there. Measured on the Intel stack: a tray
+        // holding 2 MB of private memory goes to 39 MB the first time this
+        // window opens, and nothing gives it back. Releasing the target does
+        // not; the device belongs to the factory. Releasing the factory too
+        // returns about a third of it. The rest is the driver's own
+        // initialization, and only ending the process frees that.
+        //
+        // Software costs 6.8 MB against 39.5 MB, and it is not slower here:
+        // 12.6 ms a frame against 15.9 ms for eight hundred primitives, since
+        // this is a panel and a line graph that repaints about once a second,
+        // not a scene. There is no GPU work to be worth a GPU's setup.
         let target = unsafe {
             self.factory.CreateHwndRenderTarget(
-                &D2D1_RENDER_TARGET_PROPERTIES::default(),
+                &D2D1_RENDER_TARGET_PROPERTIES {
+                    r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                    ..Default::default()
+                },
                 &D2D1_HWND_RENDER_TARGET_PROPERTIES {
                     hwnd: self.window,
                     pixelSize: size,
@@ -3073,8 +3092,20 @@ unsafe extern "system" fn wnd_proc(
                 // alternative is a dialog with one sensible answer.
                 this.save_if_dirty();
 
-                // Closing hides; the tray icon is the program's real home.
-                let _ = ShowWindow(window, SW_HIDE);
+                // Closing destroys, rather than hiding. The tray icon is the
+                // program's real home, and a hidden window is not free: it
+                // holds a D2D factory, a DirectWrite factory, eleven text
+                // formats and a render target with a back buffer the size of
+                // the window, none of which a window nobody can see has any
+                // use for. Hiding kept all of it for the life of the process,
+                // which is what took a 2 MB tray to twenty-something and left
+                // it there.
+                //
+                // Reopening builds a fresh one. The tray already knew how:
+                // its open path checks IsWindow and rebuilds when the handle
+                // no longer names anything, which was written as a recovery
+                // and is now the ordinary route.
+                let _ = DestroyWindow(window);
                 return LRESULT(0);
             }
             WM_DESTROY => {

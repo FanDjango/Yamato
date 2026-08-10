@@ -917,6 +917,21 @@ impl Tray {
             }
         }
 
+        // A closed window destroys itself, and this is where what it left
+        // behind goes. Keeping the box past its window is wrong twice over:
+        // it holds a handle that no longer names anything while this function
+        // writes a fresh readout into it every second, and it holds the D2D
+        // and DirectWrite factories, the type ramp and the render target's
+        // back buffer, which is most of what closing was supposed to return.
+        // Reopening builds a fresh one; open_settings has always known how.
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|s| unsafe { IsWindow(s.hwnd()) } == 0)
+        {
+            self.settings = None;
+        }
+
         // The settings window, if open, gets the whole sample rather than
         // just what fits in a tooltip.
         if let Some(settings) = self.settings.as_mut() {
