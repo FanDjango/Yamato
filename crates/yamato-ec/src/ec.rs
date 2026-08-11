@@ -1117,10 +1117,24 @@ impl Ec {
         self.begin_transaction()?;
 
         self.io.write_port(self.status_port(), CMD_READ)?;
-        self.settle(IBF, false, "read_command")?;
 
-        self.io.write_port(self.data_port(), address)?;
-        self.settle(OBF, true, "read_result")?;
+        // The address goes out whatever the handshake did. See write_register:
+        // a command left without its operand strands the controller the same
+        // way whether it was a read or a write.
+        let took_command = self.settle(IBF, false, "read_command");
+        let sent_address = self.io.write_port(self.data_port(), address);
+
+        if let Err(e) = took_command.and(sent_address) {
+            self.drain_output();
+
+            return Err(e);
+        }
+
+        if let Err(e) = self.settle(OBF, true, "read_result") {
+            self.drain_output();
+
+            return Err(e);
+        }
 
         self.io.read_port(self.data_port())
     }
@@ -1129,17 +1143,45 @@ impl Ec {
         self.begin_transaction()?;
 
         self.io.write_port(self.status_port(), CMD_WRITE)?;
-        self.settle(IBF, false, "write_command")?;
 
-        self.io.write_port(self.data_port(), address)?;
-        self.settle(IBF, false, "write_address")?;
-
-        self.io.write_port(self.data_port(), value)?;
+        // Past this point the command is in flight, and every operand it
+        // expects gets written even when the handshake goes wrong.
+        //
+        // An unfinished command is not a cancelled one. There is no framing on
+        // these two ports and no way to say "never mind": the controller has
+        // counted a command byte and will treat the next byte written by
+        // anyone at all as the operand it is still owed. Not just our next
+        // pass - Vantage polling, or acpi.sys opening a burst with 0x82. That
+        // byte lands as a value in a register nobody addressed, and the writer
+        // waits forever for an acknowledgement of a command the controller
+        // never saw, with every other EC client queued behind it.
+        //
+        // So finish the sequence with the bytes we chose, report the first
+        // thing that went wrong, and leave the controller at a command
+        // boundary.
+        let took_command = self.settle(IBF, false, "write_command");
+        let sent_address = self.io.write_port(self.data_port(), address);
+        let took_address = self.settle(IBF, false, "write_address");
+        let sent_value = self.io.write_port(self.data_port(), value);
 
         // Wait for the controller to actually take the value before letting go
         // of the lock. Returning with a byte still in flight means the next
         // caller starts talking over the tail of this transaction.
-        self.settle(IBF, false, "write_value")
+        let took_value = self.settle(IBF, false, "write_value");
+
+        match took_command
+            .and(sent_address)
+            .and(took_address)
+            .and(sent_value)
+            .and(took_value)
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.drain_output();
+
+                Err(e)
+            }
+        }
     }
 
     /// Waits until the controller is idle with nothing left over.
@@ -1174,10 +1216,10 @@ impl Ec {
     /// Waits for one status bit to reach a state, part way through a
     /// transaction.
     ///
-    /// On failure the controller is left mid-sequence, expecting bytes we are
-    /// never going to send, so this clears it out before giving up. Without
-    /// that, the next transaction's command byte gets consumed as this one's
-    /// missing operand and lands in a register nobody chose.
+    /// Reports and nothing more. Recovery belongs to the caller, which is the
+    /// only place that knows how many operand bytes the command it issued is
+    /// still owed; clearing up from in here could only ever drain the output
+    /// buffer, which is not what strands a controller mid-command.
     fn settle(&self, bit: u8, set: bool, step: &'static str) -> Result<(), Error> {
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
 
@@ -1188,8 +1230,6 @@ impl Ec {
             }
 
             if Instant::now() >= deadline {
-                self.abandon_transaction();
-
                 return Err(Error::Call { function: step, code: status as u32 });
             }
 
@@ -1197,10 +1237,15 @@ impl Ec {
         }
     }
 
-    /// Best effort tidy-up after a transaction we could not finish.
+    /// Takes back whatever the controller is still holding for us after a
+    /// transaction that did not go to plan.
     ///
-    /// Nothing here can fail usefully. We are already in the error path.
-    fn abandon_transaction(&self) {
+    /// The operands are already out by the time this runs, so the controller
+    /// is at a command boundary and the only thing left to clear is the output
+    /// buffer: a result from a read that timed out, or a byte an aborted
+    /// sequence produced on its way past. Best effort. Nothing here can fail
+    /// usefully; we are already on the error path.
+    fn drain_output(&self) {
         for _ in 0..DRAIN_READS {
             match self.io.read_port(self.status_port()) {
                 Ok(status) if status & OBF != 0 => {
@@ -1271,6 +1316,13 @@ mod tests {
         /// Fans that take every byte of a write and then do not hold the
         /// value, which is a failure mode real second fans have.
         declines: [bool; 2],
+        /// Whether the status port reports the input buffer permanently full,
+        /// so a settle wait runs all the way to its deadline.
+        ibf_stuck: bool,
+        /// Data bytes still to be taken normally before that happens. Armed
+        /// rather than set outright, because begin_transaction has to see an
+        /// idle controller before any of this can start.
+        stick_ibf_after: Option<usize>,
         temps: [u8; PROBE_TEMPS],
         /// Every register-level write, in order. The handback proof compares
         /// these journals across layouts.
@@ -1294,6 +1346,8 @@ mod tests {
                     selector: 0,
                     fan_ctrl: [FAN_BIOS; 2],
                     declines: [false; 2],
+                    ibf_stuck: false,
+                    stick_ibf_after: None,
                     temps: [0x30, 0x2e, 0x00, 0x2d, 0x00, 0x00, 0x00, 0x00],
                     writes: Vec::new(),
                 }),
@@ -1336,6 +1390,19 @@ mod tests {
             self.state.lock().unwrap().declines[fan] = true;
         }
 
+        /// After `data_bytes` more bytes on the data port, stop ever clearing
+        /// IBF. A controller that has taken part of a command and then stops
+        /// acknowledging, which is what a settle timeout is on real hardware.
+        fn stick_ibf_after(&self, data_bytes: usize) {
+            self.state.lock().unwrap().stick_ibf_after = Some(data_bytes);
+        }
+
+        /// Whether the controller is at a command boundary rather than part
+        /// way through counting out a command's operands.
+        fn at_command_boundary(&self) -> bool {
+            matches!(self.state.lock().unwrap().phase, Phase::Idle)
+        }
+
         fn fan_ctrl(&self) -> [u8; 2] {
             self.state.lock().unwrap().fan_ctrl
         }
@@ -1376,7 +1443,12 @@ mod tests {
             }
 
             if port == self.layout.status_port() {
-                return Ok(if state.obf.is_some() { OBF } else { 0 });
+                let mut status = if state.obf.is_some() { OBF } else { 0 };
+                if state.ibf_stuck {
+                    status |= IBF;
+                }
+
+                return Ok(status);
             }
 
             Ok(state.obf.take().unwrap_or(0xff))
@@ -1424,6 +1496,15 @@ mod tests {
                 Phase::Idle => {}
             }
 
+            match state.stick_ibf_after {
+                Some(0) => {
+                    state.ibf_stuck = true;
+                    state.stick_ibf_after = None;
+                }
+                Some(remaining) => state.stick_ibf_after = Some(remaining - 1),
+                None => {}
+            }
+
             Ok(())
         }
     }
@@ -1454,6 +1535,31 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn a_write_that_times_out_still_finishes_the_command_it_started() {
+        // The freeze this exists to prevent. A write that gives up between
+        // the address and the value leaves the controller counting bytes, and
+        // the next byte written by anyone at all becomes that value: our own
+        // next pass, Vantage polling, or acpi.sys opening a burst with 0x82.
+        // The stray byte lands in the register we had already addressed, and
+        // the writer waits for an acknowledgement of a command the controller
+        // never saw, with every other EC client queued behind it.
+        let controller = FakeEc::thinkpad(Layout::Standard);
+        controller.stick_ibf_after(0);
+
+        let ec = ec_with(controller);
+        let outcome = ec.write_register(REG_FAN_SELECT, 0);
+
+        assert!(
+            outcome.is_err(),
+            "a controller that never takes the byte has to be reported, not swallowed"
+        );
+        assert!(
+            fake(&ec).at_command_boundary(),
+            "the controller is still owed an operand, so the next byte anyone writes becomes it"
+        );
     }
 
     fn ec_with(fake: FakeEc) -> Ec {
