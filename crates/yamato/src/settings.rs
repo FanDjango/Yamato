@@ -2647,7 +2647,7 @@ impl Settings {
                 height,
                 knob.label(),
                 &knob.value(&self.config),
-                theme::ACCENT,
+                theme::YELLOW,
             )?;
 
             *row = (cl, y, cr, y + height);
@@ -2731,7 +2731,7 @@ impl Settings {
                         height,
                         knob.label(),
                         &knob.value(&point),
-                        theme::ACCENT,
+                        theme::YELLOW,
                     )?;
 
                     *row = (cl, y, cr, y + height);
@@ -2909,17 +2909,16 @@ impl Settings {
 
         let row = 24.0;
 
-        // Accent, and a rectangle recorded, for the same reason Profile has
-        // both: this row answers a click.
+        // Bright yellow, because this row is user-changeable and answers a click.
         self.row_wash(target, cl, cr, y, row, self.mode_hot.get())?;
-        self.kv_row(target, cl, cr, y, row, "Mode", self.readout.mode, theme::ACCENT)?;
+        self.kv_row(target, cl, cr, y, row, "Mode", self.readout.mode, theme::YELLOW)?;
         self.mode_row.set((cl, y, cr, y + row));
         y += row;
 
-        // Drawn in the accent color, because unlike its neighbors this row
+        // Drawn in bright yellow, because this row is user-changeable and
         // does something when clicked.
         self.row_wash(target, cl, cr, y, row, self.profile_hot.get())?;
-        self.kv_row(target, cl, cr, y, row, "Profile", &self.readout.profile, theme::ACCENT)?;
+        self.kv_row(target, cl, cr, y, row, "Profile", &self.readout.profile, theme::YELLOW)?;
         self.profile_row.set((cl, y, cr, y + row));
         y += row;
 
@@ -2958,7 +2957,7 @@ impl Settings {
                 row,
                 "Level",
                 &self.held_level().to_string(),
-                theme::ACCENT,
+                theme::YELLOW,
             )?;
             self.level_row.set((cl, y, cr, y + row));
             y += row;

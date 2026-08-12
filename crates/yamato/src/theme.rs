@@ -53,6 +53,9 @@ pub const TEXT_FAINT: D2D1_COLOR_F = rgb(0x5f6674);
 pub const ACCENT: D2D1_COLOR_F = rgb(0xce1b22);
 pub const ACCENT_BRIGHT: D2D1_COLOR_F = rgb(0xff6e6e);
 
+/// Bright yellow for user-changeable settings.
+pub const YELLOW: D2D1_COLOR_F = rgb(0xffeb3b);
+
 /// Thermal bands, matching the tray tints exactly: green while things are
 /// fine, amber warming, red hot.
 pub const COOL: D2D1_COLOR_F = rgb(COOL_HEX);
