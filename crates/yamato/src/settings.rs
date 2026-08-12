@@ -2908,6 +2908,34 @@ impl Settings {
         y += theme::SPACE_MD;
 
         let row = 24.0;
+
+        // Accent, and a rectangle recorded, for the same reason Profile has
+        // both: this row answers a click.
+        self.row_wash(target, cl, cr, y, row, self.mode_hot.get())?;
+        self.kv_row(target, cl, cr, y, row, "Mode", self.readout.mode, theme::ACCENT)?;
+        self.mode_row.set((cl, y, cr, y + row));
+        y += row;
+
+        // Drawn in the accent color, because unlike its neighbors this row
+        // does something when clicked.
+        self.row_wash(target, cl, cr, y, row, self.profile_hot.get())?;
+        self.kv_row(target, cl, cr, y, row, "Profile", &self.readout.profile, theme::ACCENT)?;
+        self.profile_row.set((cl, y, cr, y + row));
+        y += row;
+
+        // Display the EC controller speed byte
+        let ctrl_display = if self.readout.fan_ctrl == yamato_ec::FAN_BIOS {
+            "0x80 (BIOS)".to_string()
+        } else if self.readout.fan_ctrl == yamato_ec::FAN_DISENGAGED {
+            "0x40 (Disengaged)".to_string()
+        } else if self.readout.fan_ctrl <= yamato_ec::FAN_LEVEL_MAX {
+            format!("0x{:02x} (Level {})", self.readout.fan_ctrl, self.readout.fan_ctrl)
+        } else {
+            format!("0x{:02x}", self.readout.fan_ctrl)
+        };
+        self.kv_row(target, cl, cr, y, row, "EC Ctrl", &ctrl_display, theme::TEXT)?;
+        y += row;
+
         let fan = if self.readout.fan_rpm[1] > 0 {
             format!("{} / {} rpm", self.readout.fan_rpm[0], self.readout.fan_rpm[1])
         } else {
@@ -2915,12 +2943,6 @@ impl Settings {
         };
 
         self.kv_row(target, cl, cr, y, row, "Fan", &fan, theme::TEXT)?;
-        y += row;
-        // Accent, and a rectangle recorded, for the same reason Profile has
-        // both: this row answers a click.
-        self.row_wash(target, cl, cr, y, row, self.mode_hot.get())?;
-        self.kv_row(target, cl, cr, y, row, "Mode", self.readout.mode, theme::ACCENT)?;
-        self.mode_row.set((cl, y, cr, y + row));
         y += row;
 
         // Only while a level is held. Nothing below moves when it is absent
@@ -2943,12 +2965,7 @@ impl Settings {
         } else {
             self.level_row.set((0.0, 0.0, 0.0, 0.0));
         }
-        // Drawn in the accent color, because unlike its neighbors this row
-        // does something when clicked.
-        self.row_wash(target, cl, cr, y, row, self.profile_hot.get())?;
-        self.kv_row(target, cl, cr, y, row, "Profile", &self.readout.profile, theme::ACCENT)?;
-        self.profile_row.set((cl, y, cr, y + row));
-        y += row + theme::SPACE_SM;
+        y += theme::SPACE_SM;
 
         self.divider(target, cl, cr, y)?;
         y += theme::SPACE_MD;
