@@ -1927,6 +1927,7 @@ unsafe extern "system" fn wnd_proc(
             WM_TRAY => {
                 match lparam as u32 {
                     WM_RBUTTONUP | WM_CONTEXTMENU => tray.show_menu(),
+                    WM_LBUTTONUP => tray.on_command(ID_SETTINGS),
                     WM_LBUTTONDBLCLK => tray.on_command(ID_SETTINGS),
                     _ => {}
                 }
