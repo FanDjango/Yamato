@@ -136,10 +136,16 @@ impl EcLock {
             return Err(Error::Busy);
         }
 
+        // Abandoned means the previous holder died holding this, which is the
+        // one case where the controller can be part way through a command
+        // with nobody left to finish it. The lock is ours either way; the
+        // caller is told, because it is the only thing that can put the
+        // hardware right before driving it. See Ec::locked.
+        let mut abandoned = false;
+
         match unsafe { WaitForSingleObject(ec, LOCK_TIMEOUT_MS) } {
-            // Abandoned means the previous holder died mid-transaction. The
-            // controller may have a byte in flight, but the lock is ours.
-            WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+            WAIT_OBJECT_0 => {}
+            WAIT_ABANDONED => abandoned = true,
             _ => return Err(Error::Busy),
         }
 
@@ -152,7 +158,12 @@ impl EcLock {
             }
 
             match unsafe { WaitForSingleObject(isa, LOCK_TIMEOUT_MS) } {
-                WAIT_OBJECT_0 | WAIT_ABANDONED => isa,
+                WAIT_OBJECT_0 => isa,
+                WAIT_ABANDONED => {
+                    abandoned = true;
+
+                    isa
+                }
                 _ => {
                     // Refused halfway. Let the first one go rather than sit
                     // on it while reporting Busy: a holder that keeps what it
@@ -166,7 +177,7 @@ impl EcLock {
             ptr::null_mut()
         };
 
-        Ok(EcGuard { ec, isa, _lock: PhantomData })
+        Ok(EcGuard { ec, isa, abandoned, _lock: PhantomData })
     }
 }
 
@@ -187,7 +198,18 @@ pub struct EcGuard<'a> {
     /// say later.
     ec: HANDLE,
     isa: HANDLE,
+    /// Whether this was taken from a holder that died still holding it.
+    abandoned: bool,
     _lock: PhantomData<&'a EcLock>,
+}
+
+impl EcGuard<'_> {
+    /// Whether the last holder died mid-transaction, so the controller may be
+    /// part way through counting out a command's operands with nobody left to
+    /// send them.
+    pub fn abandoned(&self) -> bool {
+        self.abandoned
+    }
 }
 
 impl Drop for EcGuard<'_> {

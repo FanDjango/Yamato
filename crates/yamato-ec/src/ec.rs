@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::lock::EcLock;
+use crate::lock::{EcGuard, EcLock};
 use crate::pawnio::{Error, Layout, PawnIo};
 
 /// Status register bits.
@@ -72,6 +72,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// How many stale bytes to clear before deciding the controller is wedged and
 /// not just behind.
 const DRAIN_READS: usize = 8;
+
+/// How many whole transactions to spend getting a straight answer out of a
+/// controller somebody else left part way through a command.
+///
+/// A command is owed at most two operand bytes, and each attempt satisfies
+/// one, so two would do and the third is there to answer rather than to
+/// hope.
+const RESYNC_ATTEMPTS: usize = 3;
 
 /// Ceiling on one whole read pass, regardless of how the individual waits go.
 ///
@@ -705,7 +713,7 @@ impl Ec {
     /// on top are for windows that are decoded but empty, which return
     /// constants that a status-bit wait can sail straight through.
     fn probe(&self, until: Instant) -> Result<Probe, Error> {
-        let _guard = self.lock.lock()?;
+        let _guard = self.locked()?;
         let layout = self.io.layout();
 
         // LpcIO refuses every port until a slot is selected and its BARs
@@ -895,7 +903,7 @@ impl Ec {
     /// Reads everything in one locked pass, so a sample is internally
     /// consistent and not smeared across other tools' accesses.
     pub fn sample(&self) -> Result<EcState, Error> {
-        let _guard = self.lock.lock()?;
+        let _guard = self.locked()?;
         self.ensure_prepared()?;
         // A whole-pass deadline on top of the per-wait one, started before the
         // first transaction. The seven fan and selector reads below were once
@@ -978,7 +986,7 @@ impl Ec {
     ///
     /// It retries, because the EC does sometimes need a moment.
     pub fn set_fan(&self, value: u8) -> Result<u8, Error> {
-        let _guard = self.lock.lock()?;
+        let _guard = self.locked()?;
         self.ensure_prepared()?;
         let _selector = SelectorGuard { ec: self };
 
@@ -1048,7 +1056,7 @@ impl Ec {
     /// about which one was refused.
     pub fn release_to_bios(&self) -> Result<(), Error> {
         for attempt in 0..6 {
-            if let Ok(_guard) = self.lock.lock() {
+            if let Ok(_guard) = self.locked() {
                 return self.write_bios_verified();
             }
 
@@ -1237,14 +1245,58 @@ impl Ec {
         }
     }
 
-    /// Takes back whatever the controller is still holding for us after a
-    /// transaction that did not go to plan.
+    /// Takes the locks, and puts the controller right first when it was left
+    /// in a state the status register cannot describe.
+    fn locked(&self) -> Result<EcGuard<'_>, Error> {
+        let guard = self.lock.lock()?;
+
+        if guard.abandoned() {
+            self.resync();
+        }
+
+        Ok(guard)
+    }
+
+    /// Walks the controller back to a command boundary after a holder died
+    /// part way through a command.
     ///
-    /// The operands are already out by the time this runs, so the controller
-    /// is at a command boundary and the only thing left to clear is the output
-    /// buffer: a result from a read that timed out, or a byte an aborted
-    /// sequence produced on its way past. Best effort. Nothing here can fail
-    /// usefully; we are already on the error path.
+    /// Our own timeouts finish what they started, but a process that is killed
+    /// between two bytes runs no code at all. The kernel releases its mutex,
+    /// we are handed the lock, and the controller is still counting: owed an
+    /// address, or owed a value, with nobody left to send it.
+    ///
+    /// Nothing in the status register tells the two apart. "Idle" and "waiting
+    /// for the value byte of a write nobody will finish" both read IBF clear
+    /// and OBF clear, so begin_transaction waves it through and the first byte
+    /// of the next command quietly becomes the operand the last one never got.
+    /// The only way to find out is to drive a whole transaction and see
+    /// whether it answers.
+    ///
+    /// A read, specifically, and that is the point rather than an accident:
+    /// the byte this puts on the wire while finding out is CMD_READ, and 0x80
+    /// is also FAN_BIOS. The single stray byte a resync can land in
+    /// REG_FAN_CTRL therefore sets the state the handback would have set
+    /// anyway. Probing with a write risks pinning a fan on the way past.
+    fn resync(&self) {
+        for _ in 0..RESYNC_ATTEMPTS {
+            self.drain_output();
+
+            // Whichever operand the dead command was owed, this one's command
+            // byte satisfies it and the controller returns to a boundary. The
+            // attempt after that is the one that answers.
+            if self.read_register(REG_FAN_CTRL).is_ok() {
+                return;
+            }
+        }
+    }
+
+    /// Takes back whatever the controller is still holding for us.
+    ///
+    /// On our own error path the operands are already out, so this only has to
+    /// clear the output buffer: a result from a read that timed out, or a byte
+    /// an aborted sequence produced on its way past. Called from resync it is
+    /// the first half of the same job, before a real transaction settles the
+    /// rest. Best effort either way; nothing here can fail usefully.
     fn drain_output(&self) {
         for _ in 0..DRAIN_READS {
             match self.io.read_port(self.status_port()) {
@@ -1319,6 +1371,14 @@ mod tests {
         /// Whether the status port reports the input buffer permanently full,
         /// so a settle wait runs all the way to its deadline.
         ibf_stuck: bool,
+        /// Firmware that does not discriminate: a controller still counting
+        /// out a command's operands takes the next byte as one whatever port
+        /// it arrived on, so even a command byte is swallowed. The
+        /// specification implies otherwise and not every controller behaves
+        /// this way, but the ones that do are what a resync has to survive,
+        /// and a controller that recovers on its own proves nothing about
+        /// one that does not.
+        operands_before_commands: bool,
         /// Data bytes still to be taken normally before that happens. Armed
         /// rather than set outright, because begin_transaction has to see an
         /// idle controller before any of this can start.
@@ -1347,6 +1407,7 @@ mod tests {
                     fan_ctrl: [FAN_BIOS; 2],
                     declines: [false; 2],
                     ibf_stuck: false,
+                    operands_before_commands: false,
                     stick_ibf_after: None,
                     temps: [0x30, 0x2e, 0x00, 0x2d, 0x00, 0x00, 0x00, 0x00],
                     writes: Vec::new(),
@@ -1401,6 +1462,17 @@ mod tests {
         /// way through counting out a command's operands.
         fn at_command_boundary(&self) -> bool {
             matches!(self.state.lock().unwrap().phase, Phase::Idle)
+        }
+
+        /// Left counting out a write, the way a holder killed between the
+        /// address byte and the value byte leaves it. Nothing in the status
+        /// register distinguishes this from idle.
+        fn strand_mid_write(&self, address: u8) {
+            self.state.lock().unwrap().phase = Phase::WantValue(address);
+        }
+
+        fn take_operands_before_commands(&self) {
+            self.state.lock().unwrap().operands_before_commands = true;
         }
 
         fn fan_ctrl(&self) -> [u8; 2] {
@@ -1471,7 +1543,12 @@ mod tests {
                 return Ok(());
             }
 
-            if port == self.layout.status_port() {
+            // A byte on the status port is a command, unless this controller
+            // is the unforgiving kind and is still owed an operand, in which
+            // case it is taken as that operand instead.
+            let owed = state.operands_before_commands && !matches!(state.phase, Phase::Idle);
+
+            if port == self.layout.status_port() && !owed {
                 state.phase = match value {
                     CMD_READ => Phase::WantReadAddress,
                     CMD_WRITE => Phase::WantWriteAddress,
@@ -1559,6 +1636,36 @@ mod tests {
         assert!(
             fake(&ec).at_command_boundary(),
             "the controller is still owed an operand, so the next byte anyone writes becomes it"
+        );
+    }
+
+    #[test]
+    fn a_controller_left_mid_command_is_walked_back_to_a_boundary() {
+        // What a killed holder leaves behind. Our own timeouts finish what
+        // they started, but a process killed between two bytes runs no code
+        // at all: the kernel releases its mutex, the next holder is handed a
+        // lock over a controller that is still counting, and IBF and OBF read
+        // exactly as they do when it is idle.
+        let controller = FakeEc::thinkpad(Layout::Standard);
+        controller.take_operands_before_commands();
+        controller.strand_mid_write(REG_FAN_CTRL);
+
+        let ec = ec_with(controller);
+        ec.resync();
+
+        assert!(
+            fake(&ec).at_command_boundary(),
+            "a stranded controller has to be walked back before anything else drives it"
+        );
+
+        // And the one byte spent walking it back is CMD_READ, which is also
+        // FAN_BIOS. The stray operand a resync can land in the fan register
+        // is therefore the state the handback would have set anyway, which is
+        // why this probes with a read and not a write.
+        assert_eq!(
+            fake(&ec).fan_ctrl()[0],
+            FAN_BIOS,
+            "the stray operand a resync spends has to be the safe fan state"
         );
     }
 
