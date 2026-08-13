@@ -1817,6 +1817,25 @@ impl Tray {
         }
     }
 
+    /// Toggles the settings window: closes it if visible, opens it if not.
+    pub fn toggle_settings(&mut self) {
+        if let Some(settings) = self.settings.as_ref() {
+            let window = settings.hwnd();
+
+            // Check if the window exists and is visible
+            if unsafe { IsWindow(window) } != 0 && unsafe { IsWindowVisible(window) } != 0 {
+                // Window is visible, so hide it
+                unsafe {
+                    ShowWindow(window, SW_HIDE);
+                }
+                return;
+            }
+        }
+
+        // Window doesn't exist or isn't visible, so open/show it
+        self.open_settings();
+    }
+
     fn post(&self, mode: u8, level: u8) {
         if let Some(channel) = &self.channel {
             let profile = channel.get().read_profile();
@@ -1927,7 +1946,7 @@ unsafe extern "system" fn wnd_proc(
             WM_TRAY => {
                 match lparam as u32 {
                     WM_RBUTTONUP | WM_CONTEXTMENU => tray.show_menu(),
-                    WM_LBUTTONUP => tray.on_command(ID_SETTINGS),
+                    WM_LBUTTONUP => tray.toggle_settings(),
                     WM_LBUTTONDBLCLK => tray.on_command(ID_SETTINGS),
                     _ => {}
                 }
