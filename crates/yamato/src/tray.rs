@@ -423,6 +423,9 @@ pub struct Tray {
     /// Kept alive for as long as it is open. Closing it hides rather than
     /// destroys, so reopening is instant and the curve keeps its edits.
     settings: Option<Box<Settings>>,
+    /// Last known position and size of the settings window (x, y, width, height).
+    /// Saved when the window is closed so it can be restored on reopening.
+    settings_rect: Option<(i32, i32, i32, i32)>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -634,6 +637,7 @@ impl Tray {
                 fan2_ever_spun: false,
                 single_fan: false,
                 settings: None,
+                settings_rect: None,
             });
 
             // Only now that the box has settled is the address stable enough
@@ -1811,7 +1815,23 @@ impl Tray {
             // The name goes with the curve, so the window knows which profile
             // it is editing rather than looking it up again when it saves.
             match Settings::new(Editor::new(&curve), config.active_profile.clone(), self.window) {
-                Ok(window) => self.settings = Some(window),
+                Ok(window) => {
+                    // Restore the saved window position and size if available
+                    if let Some((x, y, width, height)) = self.settings_rect {
+                        unsafe {
+                            SetWindowPos(
+                                window.hwnd(),
+                                ptr::null_mut(),
+                                x,
+                                y,
+                                width,
+                                height,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
+                        }
+                    }
+                    self.settings = Some(window);
+                }
                 Err(_) => { /* nothing sensible to do; the tray stays up */ }
             }
         }
@@ -1824,10 +1844,22 @@ impl Tray {
 
             // Check if the window exists and is visible
             if unsafe { IsWindow(window) } != 0 && unsafe { IsWindowVisible(window) } != 0 {
-                // Window is visible, so hide it
-                unsafe {
-                    ShowWindow(window, SW_HIDE);
+                // Save the window position and size before closing
+                let mut rect: windows_sys::Win32::Foundation::RECT = unsafe { std::mem::zeroed() };
+                if unsafe { GetWindowRect(window, &mut rect) } != 0 {
+                    self.settings_rect = Some((
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    ));
                 }
+
+                // Window is visible, so close it completely
+                unsafe {
+                    DestroyWindow(window);
+                }
+                self.settings = None;
                 return;
             }
         }
