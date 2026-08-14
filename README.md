@@ -23,8 +23,8 @@
 > It refuses the disengaged setting outright, and refuses level 0 as a held
 > manual mode. Use it on hardware you are willing to look after.
 
-> **A hobby project. Issues and pull requests are closed, and there is no
-> support.** It was written for one ThinkPad and shared because it may suit
+> **A hobby project. Issues and pull requests may take time, and
+> support is limited.** It was written for one ThinkPad and shared because it may suit
 > yours. If it doesn't work for you, it doesn't work for you.
 >
 > That is the honest version rather than an unfriendly one. Reaching an
